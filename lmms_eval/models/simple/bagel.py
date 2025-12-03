@@ -13,6 +13,7 @@ from accelerate import (
     load_checkpoint_and_dispatch,
 )
 from loguru import logger as eval_logger
+from PIL import Image
 from tqdm import tqdm
 
 from lmms_eval.api.instance import Instance
@@ -201,6 +202,58 @@ class Bagel(lmms):
         self._load_model()
 
         eval_logger.info("Bagel model initialized successfully")
+
+    @staticmethod
+    def _strip_think_tags(text: str) -> str:
+        """
+        从 Bagel 的思维链输出中提取最终答案。
+
+        Bagel 在 think 模式下通常输出：
+            <think> ... 推理过程 ... </think> 最终答案
+        对于只关心最终答案（例如打分任务），需要去掉 <think> 段落。
+        """
+        if not isinstance(text, str):
+            return text
+
+        # 如果包含 </think>，只取其后的内容作为最终答案
+        if "</think>" in text:
+            text = text.split("</think>")[-1]
+        if "<think>" in text:
+            # 防止不配对的 <think> 残留
+            text = text.replace("<think>", "")
+        return text.strip()
+
+    def generate_text_from_image(self, prompt: str, image: Image.Image) -> str:
+        """
+        图文理解：image + text -> text（可带思维链，再提取最终答案）
+        """
+        self.set_seed(self.seed)
+
+        # 与文本生图保持一致的推理超参设置
+        inference_hyper = {
+            "max_think_token_n": self.max_think_token_n if self.show_thinking else 1024,
+            "do_sample": self.do_sample if self.show_thinking else False,
+            "text_temperature": self.text_temperature if self.show_thinking else 0.3,
+            "cfg_text_scale": self.cfg_text_scale,
+            "cfg_img_scale": 1.5,
+            "cfg_interval": [self.cfg_interval, 1.0],
+            "timestep_shift": self.timestep_shift,
+            "num_timesteps": self.num_timesteps,
+            "cfg_renorm_min": self.cfg_renorm_min,
+            "cfg_renorm_type": self.cfg_renorm_type,
+            "image_shapes": self.image_shapes,
+        }
+
+        result = self.inferencer(
+            image=image,
+            text=prompt,
+            think=self.show_thinking,
+            understanding_output=True,
+            **inference_hyper,
+        )
+
+        raw_text = result.get("text", "")
+        return self._strip_think_tags(raw_text)
 
     def _load_model(self):
         """Load Bagel model components"""
@@ -428,7 +481,15 @@ class Bagel(lmms):
         def get_uuid(task, split, doc_id):
             return f"{task}___{split}___{doc_id}"
 
-        for contexts, _, _, doc_id, task, split in [reg.args for reg in requests]:
+        for args in [reg.args for reg in requests]:
+            # 兼容未来可能的变更，这里做一次健壮解包
+            if len(args) == 6:
+                contexts, gen_kwargs, doc_to_visual, doc_id, task, split = args
+            else:
+                # 回退到旧格式：不含 doc_to_visual
+                contexts, gen_kwargs, doc_id, task, split = args
+                doc_to_visual = None
+
             doc_uuid = get_uuid(task, split, doc_id)
 
             # Check cache
@@ -440,12 +501,32 @@ class Bagel(lmms):
                         pbar.update(1)
                         continue
 
-            # Generate
-            prompt = contexts
-            output_text, output_images = self.generate_text_and_image(prompt, str(doc_id), task)
+            # 尝试获取视觉信息：如果 doc_to_visual 返回 PIL.Image，则走图文理解分支
+            use_vlm_understanding = False
+            image_for_understanding: Optional[Image.Image] = None
 
-            # Format output
-            formatted_output = self.format_output(output_text, output_images)
+            try:
+                if doc_to_visual is not None:
+                    doc = self.task_dict.get(task, {}).get(split, {}).get(doc_id, None)
+                    if doc is not None:
+                        visuals = doc_to_visual(doc)
+                        if visuals and isinstance(visuals[0], Image.Image):
+                            image_for_understanding = visuals[0]
+                            use_vlm_understanding = True
+            except Exception as e:
+                eval_logger.warning(f"Bagel doc_to_visual failed for task={task}, split={split}, doc_id={doc_id}: {e}")
+
+            prompt = contexts
+
+            if use_vlm_understanding and image_for_understanding is not None:
+                # 图文理解：image + text -> text
+                output_text = self.generate_text_from_image(prompt, image_for_understanding)
+                formatted_output = output_text
+            else:
+                # 回退到原有的文本 -> 图像 生成逻辑
+                output_text, output_images = self.generate_text_and_image(prompt, str(doc_id), task)
+                formatted_output = self.format_output(output_text, output_images)
+
             res.append(formatted_output)
 
             # Update cache
