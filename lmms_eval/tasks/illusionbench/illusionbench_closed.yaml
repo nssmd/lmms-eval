@@ -1,0 +1,55 @@
+dataset_path: json
+dataset_kwargs:
+  data_files:
+    train: /data1/zwb/hf/datasets/illusionbench/Image_properties.json
+process_docs: !function utils.illusionbench_process_docs
+task: illusionbench_closed
+test_split: train
+output_type: generate_until
+doc_to_visual: !function utils.illusionbench_doc_to_visual
+doc_to_text: !function utils.illusionbench_doc_to_text
+doc_to_target: correct_answer
+process_results: !function utils.illusionbench_process_results
+generation_kwargs:
+  max_new_tokens: 64
+  temperature: 0.0
+  top_p: 1.0
+  num_beams: 1
+  do_sample: false
+metric_list:
+  - metric: illusionbench_acc
+    aggregation: !function utils.illusionbench_aggregate_overall
+    higher_is_better: true
+  - metric: illusionbench_tf_acc
+    aggregation: !function utils.illusionbench_aggregate_tf
+    higher_is_better: true
+  - metric: illusionbench_select_acc
+    aggregation: !function utils.illusionbench_aggregate_select
+    higher_is_better: true
+  - metric: acc_diff_0
+    aggregation: !function utils.illusionbench_aggregate_diff_0
+    higher_is_better: true
+  - metric: acc_diff_1
+    aggregation: !function utils.illusionbench_aggregate_diff_1
+    higher_is_better: true
+  - metric: acc_diff_2
+    aggregation: !function utils.illusionbench_aggregate_diff_2
+    higher_is_better: true
+  - metric: acc_cat_A
+    aggregation: !function utils.illusionbench_aggregate_cat_A
+    higher_is_better: true
+  - metric: acc_cat_B
+    aggregation: !function utils.illusionbench_aggregate_cat_B
+    higher_is_better: true
+  - metric: acc_cat_C
+    aggregation: !function utils.illusionbench_aggregate_cat_C
+    higher_is_better: true
+  - metric: acc_cat_D
+    aggregation: !function utils.illusionbench_aggregate_cat_D
+    higher_is_better: true
+  - metric: acc_cat_E
+    aggregation: !function utils.illusionbench_aggregate_cat_E
+    higher_is_better: true
+metadata:
+  version: 0.1
+  prompt_type: manual
