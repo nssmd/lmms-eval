@@ -398,7 +398,13 @@ class Bagel(lmms):
         }
 
         # Generate
-        result = self.inferencer(text=prompt, think=self.show_thinking, **inference_hyper)
+        result = self.inferencer(
+            text=prompt,
+            think=self.show_thinking,
+            understanding_output=True,  # ← 添加这个参数！
+            **inference_hyper
+        )
+
 
         # Extract text
         output_text = result.get("text", "")
@@ -428,7 +434,15 @@ class Bagel(lmms):
         def get_uuid(task, split, doc_id):
             return f"{task}___{split}___{doc_id}"
 
-        for contexts, _, _, doc_id, task, split in [reg.args for reg in requests]:
+        for args in [reg.args for reg in requests]:
+            # 标准格式: (contexts, gen_kwargs, doc_to_visual, doc_id, task, split)
+            if len(args) == 6:
+                contexts, gen_kwargs, doc_to_visual, doc_id, task, split = args
+            else:
+                # 兼容旧 cache 或特殊构造: 没有 doc_to_visual
+                contexts, gen_kwargs, doc_id, task, split = args
+                doc_to_visual = None
+
             doc_uuid = get_uuid(task, split, doc_id)
 
             # Check cache
@@ -443,9 +457,8 @@ class Bagel(lmms):
             # Generate
             prompt = contexts
             output_text, output_images = self.generate_text_and_image(prompt, str(doc_id), task)
-
-            # Format output
             formatted_output = self.format_output(output_text, output_images)
+
             res.append(formatted_output)
 
             # Update cache
