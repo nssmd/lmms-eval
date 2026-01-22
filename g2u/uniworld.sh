@@ -9,10 +9,10 @@
 #
 # Examples:
 #   # ChartQA
-#   bash /home/aiscuser/lmms-eval/g2u/uniworld.sh "0" "chartqa100" "./logs/chartqa"
+#   bash /blob/lmms-eval/g2u/uniworld.sh "0" "chartqa100" "./logs/chartqa"
 #
 #   # Uni-MMMU Jigsaw Visual CoT
-#   bash /home/aiscuser/lmms-eval/g2u/uniworld.sh "0,1" "uni_mmmu_jigsaw100_visual_cot" "./logs/jigsaw"
+#   bash /blob/lmms-eval/g2u/uniworld.sh "0,1" "uni_mmmu_jigsaw100_visual_cot" "./logs/jigsaw"
 #
 #   # Uni-MMMU Maze Visual CoT
 #   bash uniworld_general.sh "0,1" "uni_mmmu_maze100_visual_cot" "./logs/maze"

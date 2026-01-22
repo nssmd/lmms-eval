@@ -10,7 +10,7 @@ import torch
 from PIL import Image
 
 # Add UniWorld path
-sys.path.insert(0, '/home/aiscuser/lmms-eval/UniWorld/UniWorld-V1')
+sys.path.insert(0, '/blob/lmms-eval/UniWorld/UniWorld-V1')
 
 from transformers import AutoProcessor, set_seed
 from univa.models.qwen2p5vl.modeling_univa_qwen2p5vl import UnivaQwen2p5VLForConditionalGeneration

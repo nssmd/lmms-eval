@@ -8,13 +8,13 @@
 #
 # Examples:
 #   # Uni-MMMU Jigsaw Visual CoT
-#   bash /home/aiscuser/lmms-eval/g2u/uniworld_cot.sh "0,1" "uni_mmmu_jigsaw100_visual_cot" "./logs/jigsaw_cot"
+#   bash /blob/lmms-eval/g2u/uniworld_cot.sh "0,1" "uni_mmmu_jigsaw100_visual_cot" "./logs/jigsaw_cot"
 #
 #   # Uni-MMMU Maze Visual CoT
-#   bash /home/aiscuser/lmms-eval/g2u/uniworld_cot.sh "0,1" "uni_mmmu_maze100_visual_cot" "./logs/maze_cot"
+#   bash /blob/lmms-eval/g2u/uniworld_cot.sh "0,1" "uni_mmmu_maze100_visual_cot" "./logs/maze_cot"
 #
 #   # All Uni-MMMU CoT tasks
-#   bash /home/aiscuser/lmms-eval/g2u/uniworld_cot.sh "0,1" "uni_mmmu_cot" "./logs/uni_mmmu_cot"
+#   bash /blob/lmms-eval/g2u/uniworld_cot.sh "0,1" "uni_mmmu_cot" "./logs/uni_mmmu_cot"
 
 # ============ Configuration ============
 GPU_IDS=${1:-"0"}

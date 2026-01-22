@@ -23,7 +23,7 @@ echo ""
 echo "=========================================="
 echo "Step 1: Installing lmms-eval dependencies"
 echo "=========================================="
-cd /home/aiscuser/lmms-eval
+cd /blob/lmms-eval
 uv pip install -e .
 echo "✅ lmms-eval installed"
 echo ""
@@ -32,7 +32,7 @@ echo ""
 echo "=========================================="
 echo "Step 2: Installing UniWorld dependencies"
 echo "=========================================="
-cd /home/aiscuser/lmms-eval/UniWorld/UniWorld-V1
+cd /blob/lmms-eval/UniWorld/UniWorld-V1
 
 # 重要的包版本（UniWorld优先）
 echo "Installing UniWorld-specific packages..."
@@ -67,7 +67,7 @@ echo "=========================================="
 echo ""
 echo "Next steps:"
 echo "1. Test UniWorld model loading:"
-echo "   cd /home/aiscuser/lmms-eval"
+echo "   cd /blob/lmms-eval"
 echo "   python test_uniworld_direct.py"
 echo ""
 echo "2. Run evaluation:"
