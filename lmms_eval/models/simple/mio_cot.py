@@ -518,22 +518,15 @@ class MIOVisualCoT(lmms):
             question_match = re.search(r'\[QUESTION\](.*?)\[/QUESTION\]', contexts, re.DOTALL)
 
             if gen_prompt_match and question_match:
-                # Use custom generation prompt from task config
-                custom_gen_prompt = gen_prompt_match.group(1).strip()
+                # Use custom generation prompt from task config (WITHOUT question)
+                generation_prompt = gen_prompt_match.group(1).strip()
                 actual_question = question_match.group(1).strip()
-                
-                # Replace {question} placeholder if exists, otherwise append question
-                if "{question}" in custom_gen_prompt:
-                    generation_prompt = custom_gen_prompt.replace("{question}", actual_question)
-                else:
-                    # Append question to generation prompt
-                    generation_prompt = f"{custom_gen_prompt}\n\nQuestion: {actual_question}"
                 
                 # Update contexts to be just the question for stage 2 (remove tags)
                 contexts = contexts.replace(f"[GEN_PROMPT]{gen_prompt_match.group(1)}[/GEN_PROMPT]", "")
                 contexts = contexts.replace(f"[QUESTION]{question_match.group(1)}[/QUESTION]", question_match.group(1))
                 contexts = contexts.strip()  # Clean up whitespace
-                eval_logger.info("Using custom generation prompt from task config")
+                eval_logger.info("Using custom generation prompt from task config (without question)")
             else:
                 # Use default template
                 generation_prompt = self.generation_prompt_template.format(question=contexts)
