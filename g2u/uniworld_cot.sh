@@ -26,7 +26,7 @@ HF_REPO=${6:-""}  # Optional: HF repo for uploading logs (e.g., "username/uniwor
 BATCH_SIZE=1
 
 # Model args
-MODEL_ARGS="pretrained=${MODEL_PATH}"
+MODEL_ARGS="pretrained=${MODEL_PATH},min_pixels=112*112,max_pixels=224*224"
 if [ -n "$HF_REPO" ]; then
     MODEL_ARGS="${MODEL_ARGS},hf_repo=${HF_REPO},hf_upload=True"
     echo "📤 Hugging Face upload enabled: ${HF_REPO}"

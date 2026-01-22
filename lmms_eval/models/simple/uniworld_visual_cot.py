@@ -173,12 +173,24 @@ class UniWorldVisualCoT(lmms):
             contexts, gen_kwargs, doc_to_visual, doc_id, task, split = request.args
 
             try:
-                # Extract original image if available
-                original_images = []
-                if doc_to_visual is not None:
-                    doc = self.task_dict[task][split][doc_id]
-                    visuals = [doc_to_visual(doc)]
-                    original_images = self.flatten(visuals)
+                # Extract original image (required for Visual CoT)
+                if doc_to_visual is None:
+                    raise ValueError(f"doc_to_visual is None for doc {doc_id}")
+
+                if not hasattr(self, 'task_dict'):
+                    raise ValueError(f"task_dict not set for model")
+
+                if task not in self.task_dict:
+                    raise ValueError(f"Task '{task}' not found in task_dict. Available: {list(self.task_dict.keys())}")
+
+                doc = self.task_dict[task][split][doc_id]
+                visuals = [doc_to_visual(doc)]
+                original_images = self.flatten(visuals)
+
+                if not original_images:
+                    raise ValueError(f"No original images found for doc {doc_id}")
+
+                eval_logger.info(f"[Doc {doc_id}] Loaded {len(original_images)} original image(s)")
 
                 # Stage 1: Generate visualization
                 eval_logger.info(f"[Doc {doc_id}] Stage 1: Generating visualization...")
@@ -207,6 +219,10 @@ class UniWorldVisualCoT(lmms):
                 res.append(final_answer)
                 eval_logger.info(f"[Doc {doc_id}] ✅ Answer: {final_answer[:100]}...")
 
+                # Clear GPU cache to prevent OOM
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
             except Exception as e:
                 eval_logger.error(f"Error in visual CoT for doc_id={doc_id}: {e}")
                 import traceback
@@ -226,36 +242,69 @@ class UniWorldVisualCoT(lmms):
         original_images: List,
     ) -> Optional[str]:
         """Stage 1: Generate visualization image"""
-        # Create generation prompt
-        gen_prompt = f"{prompt}\n\nGenerate a clear schematic visualization to help understand this problem."
+        from qwen_vl_utils import process_vision_info
+        import re
 
-        # Use UniWorld's generation capability
+        # Extract generation prompt from [GEN_PROMPT]...[/GEN_PROMPT] tags
+        gen_match = re.search(r'\[GEN_PROMPT\](.*?)\[/GEN_PROMPT\]', prompt, re.DOTALL)
+        if gen_match:
+            gen_prompt = gen_match.group(1).strip()
+        else:
+            # Fallback: use the whole prompt with a generation instruction
+            gen_prompt = f"{prompt}\n\nGenerate a clear schematic visualization to help understand this problem."
+
         try:
-            # Call UniWorld's internal generation method
-            output = self.uniworld._process_single_request(
-                context=gen_prompt,
-                doc_to_visual=None,  # No input images for pure generation
+            # Prepare messages for image generation
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        *[{"type": "image", "image": img} for img in original_images],
+                        {"type": "text", "text": gen_prompt}
+                    ]
+                }
+            ]
+
+            # Process inputs
+            text = self.uniworld.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            image_inputs, video_inputs = process_vision_info(messages)
+
+            inputs = self.uniworld.processor(
+                text=[text],
+                images=image_inputs,
+                videos=video_inputs,
+                padding=True,
+                return_tensors="pt",
+            ).to(self.uniworld._device)
+
+            # Call UniWorld's image generation method directly
+            image_path = self.uniworld._generate_image(
+                prompt_text=gen_prompt,
+                inputs=inputs,
+                history_image_paths=[],
                 doc_id=doc_id,
                 task=task,
-                split="",
-                gen_kwargs={},
             )
 
             # Parse output to get image path
-            if isinstance(output, str) and output.startswith("{"):
-                output_dict = json.loads(output)
+            if isinstance(image_path, str) and image_path.startswith("{"):
+                output_dict = json.loads(image_path)
                 images = output_dict.get("images", [])
                 if images:
-                    image_path = images[0]
+                    actual_path = images[0]
                     # Upload to HF if enabled
                     if self.hf_upload and self.hf_api:
-                        self._upload_to_hf(image_path, f"logs/{task}/images")
-                    return image_path
+                        self._upload_to_hf(actual_path, f"logs/{task}/images")
+                    return actual_path
 
             return None
 
         except Exception as e:
             eval_logger.error(f"Stage 1 generation failed: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
     def _upload_to_hf(self, file_path: str, hf_path: str):
@@ -279,15 +328,22 @@ class UniWorldVisualCoT(lmms):
         doc_id: int,
     ) -> str:
         """Stage 2: Understand with generated visualization"""
+        import re
+
         try:
+            # Extract question from [QUESTION]...[/QUESTION] tags
+            question_match = re.search(r'\[QUESTION\](.*?)\[/QUESTION\]', prompt, re.DOTALL)
+            if question_match:
+                und_prompt = question_match.group(1).strip()
+            else:
+                # Fallback: use the whole prompt
+                und_prompt = f"{prompt}\n\nBased on the visualization, provide your answer."
+
             # Load generated image
             generated_image = Image.open(generated_image_path).convert("RGB")
 
             # Combine original + generated images
             all_images = original_images + [generated_image]
-
-            # Create understanding prompt
-            und_prompt = f"{prompt}\n\nBased on the visualization, provide your answer."
 
             # Prepare messages for Qwen2.5-VL
             messages = [
