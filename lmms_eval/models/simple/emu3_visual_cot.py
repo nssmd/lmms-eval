@@ -511,12 +511,16 @@ class Emu3VisualCoT(lmms):
             # Step 5: Generate image tokens
             eval_logger.info(f"Generating {h_tokens}x{w_tokens} image tokens...")
 
+            # Note: Negative prompt may not work well for image-conditioned generation
+            # Try without it first
             with torch.no_grad():
                 out = self.model.generate(
                     input_ids,
                     max_new_tokens=self.stage1_max_new_tokens,
                     attention_mask=attention_mask,
                     prefix_allowed_tokens_fn=prefix_allowed_tokens_fn,
+                    # negative_prompt_ids=neg_input_ids,
+                    # negative_prompt_attention_mask=neg_attention_mask,
                     return_dict_in_generate=True,
                     use_cache=True,  # Enable KV cache for faster generation
                 )

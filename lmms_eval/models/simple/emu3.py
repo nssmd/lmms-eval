@@ -297,10 +297,41 @@ class Emu3(lmms):
         output_dict = {"text": text, "images": images}
         return json.dumps(output_dict, ensure_ascii=False)
 
-    def _resize_image(self, image: Image.Image, max_size: int = 512) -> Image.Image:
-        """Resize image to max_size x max_size to save memory"""
-        if image.width > max_size or image.height > max_size:
-            image = image.resize((max_size, max_size), Image.Resampling.LANCZOS)
+    def _resize_image(
+        self, image: Image.Image, max_size: int = 512, max_aspect_ratio: float = 4.5
+    ) -> Image.Image:
+        """Resize image to fit within max_size and max_aspect_ratio constraints.
+
+        Emu3 requires aspect ratio <= 5. We use 4.5 as default to have margin.
+        Images with extreme aspect ratios are padded to meet the constraint.
+        """
+        width, height = image.size
+
+        # Handle extreme aspect ratios by padding
+        aspect_ratio = max(width, height) / max(min(width, height), 1)
+        if aspect_ratio > max_aspect_ratio:
+            # Pad the shorter dimension to bring aspect ratio within bounds
+            if width > height:
+                new_height = int(width / max_aspect_ratio)
+                new_image = Image.new("RGB", (width, new_height), (255, 255, 255))
+                paste_y = (new_height - height) // 2
+                new_image.paste(image, (0, paste_y))
+                image = new_image
+            else:
+                new_width = int(height / max_aspect_ratio)
+                new_image = Image.new("RGB", (new_width, height), (255, 255, 255))
+                paste_x = (new_width - width) // 2
+                new_image.paste(image, (paste_x, 0))
+                image = new_image
+            width, height = image.size
+
+        # Resize if larger than max_size while preserving aspect ratio
+        if width > max_size or height > max_size:
+            scale = max_size / max(width, height)
+            new_width = int(width * scale)
+            new_height = int(height * scale)
+            image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
         return image
 
     def _decode_image_tokens(
