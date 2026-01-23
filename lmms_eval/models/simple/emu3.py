@@ -32,6 +32,26 @@ from lmms_eval.api.instance import Instance
 from lmms_eval.api.model import lmms
 from lmms_eval.api.registry import register_model
 
+# Patch DynamicCache to support seen_tokens property for compatibility
+# with older EMU3 model code that uses seen_tokens instead of get_seq_length()
+from transformers.cache_utils import DynamicCache
+
+if not hasattr(DynamicCache, "seen_tokens"):
+    DynamicCache.seen_tokens = property(lambda self: self.get_seq_length())
+    eval_logger.info("Patched DynamicCache with seen_tokens property for EMU3 compatibility")
+
+if not hasattr(DynamicCache, "get_max_length"):
+    # Add get_max_length method for backward compatibility
+    # Returns None since DynamicCache doesn't have a fixed max length
+    DynamicCache.get_max_length = lambda self: None
+    eval_logger.info("Patched DynamicCache with get_max_length method for EMU3 compatibility")
+
+if not hasattr(DynamicCache, "get_usable_length"):
+    # Add get_usable_length method for backward compatibility
+    # Returns the current sequence length (same as get_seq_length)
+    DynamicCache.get_usable_length = lambda self, new_seq_length, layer_idx=0: self.get_seq_length(layer_idx)
+    eval_logger.info("Patched DynamicCache with get_usable_length method for EMU3 compatibility")
+
 
 @register_model("emu3")
 class Emu3(lmms):
@@ -227,6 +247,37 @@ class Emu3(lmms):
             )
             eval_logger.info(f"Model loaded on {device}")
 
+        # Compute visual tokens for image decoding
+        self.visual_tokens = self._get_visual_tokens()
+        eval_logger.info(f"Loaded {len(self.visual_tokens)} visual tokens")
+
+    def _get_visual_tokens(self):
+        """
+        Get visual tokens from the tokenizer vocabulary.
+        """
+        # Get codebook size from vision tokenizer
+        if hasattr(self.image_tokenizer, "config"):
+            codebook_size = getattr(
+                self.image_tokenizer.config, "codebook_size", 32768
+            )
+        else:
+            codebook_size = 32768
+
+        # Get vocabulary
+        vocab = self.tokenizer.get_vocab()
+        vocab_size = len(vocab)
+
+        # Visual tokens are typically at the end of vocabulary
+        # Emu3-Chat has visual tokens from 151643 to 184410
+        start_id = vocab_size - codebook_size
+        if start_id > 0:
+            visual_token_ids = tuple(range(start_id, vocab_size))
+        else:
+            # Fallback: use known range for Emu3-Chat
+            visual_token_ids = tuple(range(151643, 151643 + codebook_size))
+
+        return visual_token_ids
+
     @property
     def batch_size(self):
         return self.batch_size_per_gpu
@@ -251,7 +302,84 @@ class Emu3(lmms):
         if image.width > max_size or image.height > max_size:
             image = image.resize((max_size, max_size), Image.Resampling.LANCZOS)
         return image
-        return image
+
+    def _decode_image_tokens(
+        self, token_ids: torch.Tensor, height: int, width: int
+    ) -> List[Image.Image]:
+        """
+        Decode image tokens to PIL Images
+
+        Args:
+            token_ids: Generated token IDs [B, seq_len]
+            height: Expected image height in tokens
+            width: Expected image width in tokens
+
+        Returns:
+            List of PIL Images
+        """
+        # Get special token IDs
+        eol_id = self.tokenizer.encode("<|extra_200|>", add_special_tokens=False)[0]
+        eof_id = getattr(self.tokenizer, "eof_token_id", None)
+        eoi_id = getattr(self.tokenizer, "eoi_token_id", None)
+        eos_id = self.tokenizer.eos_token_id
+        pad_id = self.tokenizer.pad_token_id
+
+        # Get visual token range and compute offset for codebook conversion
+        visual_tokens = self.visual_tokens
+        visual_tokens_set = set(visual_tokens)
+        # Offset to convert token IDs to codebook indices
+        # Token IDs are 151854-184621, codebook indices are 0-32767
+        visual_token_offset = min(visual_tokens)
+
+        batch_images = []
+        for batch_idx in range(token_ids.shape[0]):
+            seq = token_ids[batch_idx]
+
+            # Extract visual tokens (filter out special tokens)
+            visual_token_list = []
+            for token_id in seq:
+                token_val = token_id.item()
+                # Stop at end tokens
+                if token_val in [eof_id, eoi_id, eos_id, pad_id]:
+                    break
+                # Skip EOL tokens
+                if token_val == eol_id:
+                    continue
+                # Collect visual tokens (convert to codebook indices)
+                if token_val in visual_tokens_set:
+                    # Convert token ID to codebook index
+                    codebook_idx = token_val - visual_token_offset
+                    visual_token_list.append(codebook_idx)
+
+            # Reshape to (height, width)
+            expected_tokens = height * width
+            if len(visual_token_list) < expected_tokens:
+                eval_logger.warning(
+                    f"Expected {expected_tokens} visual tokens, got {len(visual_token_list)}"
+                )
+                # Pad with first codebook index (0) if needed
+                visual_token_list.extend(
+                    [0] * (expected_tokens - len(visual_token_list))
+                )
+            elif len(visual_token_list) > expected_tokens:
+                visual_token_list = visual_token_list[:expected_tokens]
+
+            # Convert to tensor and reshape
+            visual_tensor = torch.tensor(
+                visual_token_list, dtype=torch.long, device=self.image_tokenizer.device
+            ).reshape(height, width)
+
+            # Decode using vision tokenizer
+            decoded_image = self.image_tokenizer.decode(visual_tensor.unsqueeze(0))
+
+            # Post-process to PIL Image
+            decoded_image = decoded_image.float()
+            processed = self.image_processor.postprocess(decoded_image)
+            pil_image = processed["pixel_values"][0]
+
+            batch_images.append(pil_image)
+
+        return batch_images
 
     def _generate_text_from_image(
         self, context: str, images: List[Image.Image], gen_kwargs: dict
@@ -305,7 +433,7 @@ class Emu3(lmms):
                 top_p=top_p if do_sample else None,
                 pad_token_id=self.tokenizer.pad_token_id,
                 eos_token_id=self.tokenizer.eos_token_id,
-                use_cache=False,  # Disable cache to avoid DynamicCache issues
+                use_cache=True,  # Enable KV cache for faster generation
             )
 
         # Decode - skip the input tokens
@@ -351,7 +479,7 @@ class Emu3(lmms):
                 top_p=top_p if do_sample else None,
                 pad_token_id=self.tokenizer.pad_token_id,
                 eos_token_id=self.tokenizer.eos_token_id,
-                use_cache=False,
+                use_cache=True,  # Enable KV cache for faster generation
             )
 
         # Decode
@@ -399,7 +527,7 @@ class Emu3(lmms):
         # Define prefix constraint function for image generation
         def prefix_allowed_tokens_fn(batch_id, input_ids_seq):
             height, width = HEIGHT, WIDTH
-            visual_tokens = self.processor.visual_tokens
+            visual_tokens = self.visual_tokens
 
             image_wrapper_token_id = torch.tensor(
                 [self.tokenizer.image_wrapper_token_id],
@@ -425,16 +553,18 @@ class Emu3(lmms):
                 input_ids_seq == image_wrapper_token_id, as_tuple=True
             )[0][0]
             offset = input_ids_seq.shape[0] - position
-            if offset % (width + 1) == 0:
-                return (eol_token_id,)
-            elif offset == (width + 1) * height + 1:
-                return (eof_token_id,)
-            elif offset == (width + 1) * height + 2:
-                return (eoi_token_id,)
+            # Check termination conditions first
+            if offset > (width + 1) * height + 3:
+                return (pad_token_id,)
             elif offset == (width + 1) * height + 3:
                 return (eos_token_id,)
-            elif offset > (width + 1) * height + 3:
-                return (pad_token_id,)
+            elif offset == (width + 1) * height + 2:
+                return (eoi_token_id,)
+            elif offset == (width + 1) * height + 1:
+                return (eof_token_id,)
+            # Check for EOL at end of each row (but not at offset 0)
+            elif offset > 0 and offset % (width + 1) == 0:
+                return (eol_token_id,)
             else:
                 return visual_tokens
 
@@ -450,12 +580,10 @@ class Emu3(lmms):
                 negative_prompt_attention_mask=neg_attention_mask,
             )
 
-        # Decode image tokens using processor
-        images = self.processor.decode_image_tokens(
-            out.sequences[:, input_ids.shape[1]:],
-            height=HEIGHT,
-            width=WIDTH,
-        )
+        # Decode image tokens
+        # Extract visual tokens from generated sequence
+        generated_tokens = out.sequences[:, input_ids.shape[1]:]
+        images = self._decode_image_tokens(generated_tokens, HEIGHT, WIDTH)
 
         # Save generated images
         output_images = []

@@ -29,6 +29,27 @@ from lmms_eval.api.instance import Instance
 from lmms_eval.api.model import lmms
 from lmms_eval.api.registry import register_model
 
+# Patch DynamicCache to support seen_tokens property for compatibility
+# with older EMU3 model code that uses seen_tokens instead of get_seq_length()
+from transformers.cache_utils import DynamicCache
+
+if not hasattr(DynamicCache, "seen_tokens"):
+    # Add seen_tokens as a property for backward compatibility
+    DynamicCache.seen_tokens = property(lambda self: self.get_seq_length())
+    eval_logger.info("Patched DynamicCache with seen_tokens property for EMU3 compatibility")
+
+if not hasattr(DynamicCache, "get_max_length"):
+    # Add get_max_length method for backward compatibility
+    # Returns None since DynamicCache doesn't have a fixed max length
+    DynamicCache.get_max_length = lambda self: None
+    eval_logger.info("Patched DynamicCache with get_max_length method for EMU3 compatibility")
+
+if not hasattr(DynamicCache, "get_usable_length"):
+    # Add get_usable_length method for backward compatibility
+    # Returns the current sequence length (same as get_seq_length)
+    DynamicCache.get_usable_length = lambda self, new_seq_length, layer_idx=0: self.get_seq_length(layer_idx)
+    eval_logger.info("Patched DynamicCache with get_usable_length method for EMU3 compatibility")
+
 
 @register_model("emu3_visual_cot")
 class Emu3VisualCoT(lmms):
@@ -220,64 +241,22 @@ class Emu3VisualCoT(lmms):
 
     def _get_visual_tokens(self):
         """
-        Get visual tokens from the tokenizer vocabulary.
+        Get visual tokens from the processor's const_helper.
 
         Emu3 uses VQ-VAE to tokenize images into discrete tokens.
-        The visual tokens are typically in a specific range of the vocabulary.
+        The visual tokens are in a specific range of the vocabulary (151854-184621).
         """
-        # Try to get visual_tokens from processor first
-        if hasattr(self.processor, "visual_tokens"):
-            return self.processor.visual_tokens
-
-        # Try to get from image_tokenizer's codebook size
-        if hasattr(self.image_tokenizer, "config"):
-            codebook_size = getattr(
-                self.image_tokenizer.config, "codebook_size", 32768
-            )
-        else:
-            codebook_size = 32768  # Default Emu3 codebook size
-
-        # Find visual tokens in tokenizer vocabulary
-        # Emu3 visual tokens typically start after special tokens
-        # and are in the format <|visual token XXXX|> or similar
-        visual_token_ids = []
-
-        # Method 1: Look for tokens with "visual" in the name
-        vocab = self.tokenizer.get_vocab()
-        for token, token_id in vocab.items():
-            # Handle both string and bytes tokens
-            if isinstance(token, bytes):
-                token_str = token.decode("utf-8", errors="ignore")
-            else:
-                token_str = str(token)
-            if "visual" in token_str.lower() or "image" in token_str.lower():
-                if "token" in token_str.lower() and token_id not in visual_token_ids:
-                    visual_token_ids.append(token_id)
-
-        # Method 2: If no visual tokens found, use a range based on codebook size
-        # Emu3 typically uses token IDs starting from a specific offset
-        if len(visual_token_ids) < codebook_size:
-            # Find the starting point for visual tokens
-            # Usually after all text tokens and special tokens
-            vocab_size = len(vocab)
-
-            # Emu3 typically has visual tokens at the end of vocabulary
-            # or in a specific range. Let's try to find them.
-            # Common pattern: visual tokens are from (vocab_size - codebook_size) to vocab_size
-            start_id = vocab_size - codebook_size
-            if start_id > 0:
-                visual_token_ids = list(range(start_id, vocab_size))
-            else:
-                # Fallback: use a reasonable range
-                # Emu3-Chat typically has visual tokens from 151643 to 184410
-                visual_token_ids = list(range(151643, 151643 + codebook_size))
+        # Use const_helper to get the correct visual tokens range
+        # This is the authoritative source for visual token IDs
+        const_helper = self.processor.const_helper(height=32, width=32)
+        visual_tokens = tuple(const_helper.visual_tokens)
 
         eval_logger.debug(
-            f"Found {len(visual_token_ids)} visual tokens "
-            f"(range: {min(visual_token_ids)}-{max(visual_token_ids)})"
+            f"Got {len(visual_tokens)} visual tokens from const_helper "
+            f"(range: {visual_tokens[0]}-{visual_tokens[-1]})"
         )
 
-        return tuple(visual_token_ids)
+        return visual_tokens
 
     @property
     def batch_size(self):
@@ -300,6 +279,84 @@ class Emu3VisualCoT(lmms):
         if image.width > max_size or image.height > max_size:
             image = image.resize((max_size, max_size), Image.Resampling.LANCZOS)
         return image
+
+    def _decode_image_tokens(
+        self, token_ids: torch.Tensor, height: int, width: int
+    ) -> List[Image.Image]:
+        """
+        Decode image tokens to PIL Images
+
+        Args:
+            token_ids: Generated token IDs [B, seq_len]
+            height: Expected image height in tokens
+            width: Expected image width in tokens
+
+        Returns:
+            List of PIL Images
+        """
+        # Get special token IDs
+        eol_id = self.tokenizer.encode("<|extra_200|>", add_special_tokens=False)[0]
+        eof_id = getattr(self.tokenizer, "eof_token_id", None)
+        eoi_id = getattr(self.tokenizer, "eoi_token_id", None)
+        eos_id = self.tokenizer.eos_token_id
+        pad_id = self.tokenizer.pad_token_id
+
+        # Get visual token range and compute offset for codebook conversion
+        visual_tokens = self.visual_tokens
+        visual_tokens_set = set(visual_tokens)
+        # Offset to convert token IDs to codebook indices
+        # Token IDs are 151854-184621, codebook indices are 0-32767
+        visual_token_offset = min(visual_tokens)
+
+        batch_images = []
+        for batch_idx in range(token_ids.shape[0]):
+            seq = token_ids[batch_idx]
+
+            # Extract visual tokens (filter out special tokens)
+            visual_token_list = []
+            for token_id in seq:
+                token_val = token_id.item()
+                # Stop at end tokens
+                if token_val in [eof_id, eoi_id, eos_id, pad_id]:
+                    break
+                # Skip EOL tokens
+                if token_val == eol_id:
+                    continue
+                # Collect visual tokens (convert to codebook indices)
+                if token_val in visual_tokens_set:
+                    # Convert token ID to codebook index
+                    codebook_idx = token_val - visual_token_offset
+                    visual_token_list.append(codebook_idx)
+
+            # Reshape to (height, width)
+            expected_tokens = height * width
+            if len(visual_token_list) < expected_tokens:
+                eval_logger.warning(
+                    f"Expected {expected_tokens} visual tokens, got {len(visual_token_list)}"
+                )
+                # Pad with first codebook index (0) if needed
+                visual_token_list.extend(
+                    [0] * (expected_tokens - len(visual_token_list))
+                )
+            elif len(visual_token_list) > expected_tokens:
+                visual_token_list = visual_token_list[:expected_tokens]
+
+            # Convert to tensor and reshape
+            visual_tensor = torch.tensor(
+                visual_token_list, dtype=torch.long, device=self.image_tokenizer.device
+            ).reshape(height, width)
+
+            # Decode using vision tokenizer
+            decoded_image = self.image_tokenizer.decode(visual_tensor.unsqueeze(0))
+
+            # Post-process to PIL Image
+            decoded_image = decoded_image.float()
+            processed = self.image_processor.postprocess(decoded_image)
+            pil_image = processed["pixel_values"][0]
+
+            batch_images.append(pil_image)
+
+        return batch_images
 
     def _stage1_generate_image(
         self,
@@ -358,6 +415,12 @@ class Emu3VisualCoT(lmms):
             h_tokens = HEIGHT // spatial_scale
             w_tokens = WIDTH // spatial_scale
 
+            eval_logger.info(
+                f"Image generation: HEIGHT={HEIGHT}, WIDTH={WIDTH}, "
+                f"spatial_scale={spatial_scale}, h_tokens={h_tokens}, w_tokens={w_tokens}, "
+                f"expected_tokens={h_tokens * (w_tokens + 1) + 3}"
+            )
+
             # Build image generation prompt tokens
             image_gen_prompt = (
                 self.tokenizer.boi_token
@@ -385,180 +448,68 @@ class Emu3VisualCoT(lmms):
             neg_input_ids = neg_inputs.input_ids.to(device)
             neg_attention_mask = neg_inputs.attention_mask.to(device)
 
-            # Step 4: Define prefix constraint function for image generation
-            # Use pre-computed visual tokens from self.visual_tokens
-            visual_tokens = self.visual_tokens
+            # Step 4: Build custom prefix constraint function
+            # Note: We can't use processor.build_prefix_constrained_fn directly because
+            # it finds the FIRST img_token, but we have TWO (original image + generated image)
+            # We need to use the LAST img_token position
 
-            # Get special token IDs - handle different tokenizer attribute names
-            def get_token_id(tokenizer, attr_name, fallback_token):
-                """Get token ID from tokenizer attribute or by encoding the token string"""
-                if hasattr(tokenizer, attr_name):
-                    return getattr(tokenizer, attr_name)
-                # Try to encode the fallback token string
-                try:
-                    ids = tokenizer.encode(fallback_token, add_special_tokens=False)
-                    if ids:
-                        return ids[0]
-                except Exception:
-                    pass
-                return None
+            # Get token IDs from processor's const_helper
+            const_helper = self.processor.const_helper(height=h_tokens, width=w_tokens)
+            img_token = const_helper.img_token
+            eol_token = const_helper.eol_token
+            eof_token = const_helper.eof_token
+            eoi_token = const_helper.eoi_token
+            eos_token = const_helper.eos_token
+            pad_token = const_helper.pad_token
+            visual_tokens = const_helper.visual_tokens
 
-            # Debug: Log available tokenizer attributes
-            special_attrs = [
-                attr for attr in dir(self.tokenizer)
-                if "token" in attr.lower() and not attr.startswith("_")
-            ]
-            eval_logger.debug(f"Tokenizer special token attrs: {special_attrs}")
-
-            # Get token IDs with more fallbacks
-            # Try multiple possible attribute names for the image wrapper token
-            img_token_id = None
-            for attr, fallback in [
-                ("image_wrapper_token_id", "<|image token|>"),
-                ("img_token_id", "<|img|>"),
-                ("boi_token_id", "<|boi|>"),
-            ]:
-                img_token_id = get_token_id(self.tokenizer, attr, fallback)
-                if img_token_id is not None:
-                    eval_logger.debug(f"Found img_token_id via {attr}: {img_token_id}")
-                    break
-
-            # If still None, try to find it in the input_ids we just created
-            if img_token_id is None:
-                # The img_token should be in the generation prompt we added
-                # Look for it by checking the tokenizer's special tokens
-                if hasattr(self.tokenizer, "img_token"):
-                    img_token_str = self.tokenizer.img_token
-                    ids = self.tokenizer.encode(img_token_str, add_special_tokens=False)
-                    if ids:
-                        img_token_id = ids[0]
-                        eval_logger.debug(
-                            f"Found img_token_id via img_token attr: {img_token_id}"
-                        )
-
-            eval_logger.info(f"Image token ID: {img_token_id}")
-
-            eoi_id = get_token_id(self.tokenizer, "eoi_token_id", "<|eoi|>")
-            eof_id = get_token_id(self.tokenizer, "eof_token_id", "<|eof|>")
-            eos_id = self.tokenizer.eos_token_id
-            pad_id = self.tokenizer.pad_token_id
-
-            eval_logger.debug(
-                f"Special token IDs - eoi: {eoi_id}, eof: {eof_id}, "
-                f"eos: {eos_id}, pad: {pad_id}"
+            eval_logger.info(
+                f"Token IDs - img: {img_token}, eol: {eol_token}, eof: {eof_token}, "
+                f"eoi: {eoi_token}, eos: {eos_token}, visual_tokens range: {visual_tokens[0]}-{visual_tokens[-1]}"
             )
 
-            # Get eol token ID
-            eol_ids = self.tokenizer.encode("<|extra_200|>", add_special_tokens=False)
-            eol_id = eol_ids[0] if eol_ids else None
-            eval_logger.debug(f"EOL token ID: {eol_id}")
+            # Cache for the position of the LAST img_token
+            offset_cache = {}
+            call_count = [0]
 
-            # Store scalar values for comparison in prefix_allowed_tokens_fn
-            # (tensors might have device mismatch issues)
-            img_token_scalar = img_token_id
-            eoi_scalar = eoi_id
-            eof_scalar = eof_id
-            eos_scalar = eos_id
-            pad_scalar = pad_id
-            eol_scalar = eol_id
+            def prefix_allowed_tokens_fn(batch_id, input_ids):
+                call_count[0] += 1
 
-            # Debug: track if prefix_allowed_tokens_fn is working
-            debug_call_count = [0]
-            debug_logged = [False]
-
-            def prefix_allowed_tokens_fn(batch_id, input_ids_seq):
-                height, width = h_tokens, w_tokens
-                debug_call_count[0] += 1
-
-                # If we don't have the image wrapper token, just return visual tokens
-                if img_token_scalar is None:
-                    if not debug_logged[0]:
-                        eval_logger.warning("img_token_scalar is None!")
-                        debug_logged[0] = True
-                    return visual_tokens
-
-                # Move input_ids_seq to CPU for comparison if needed
-                if input_ids_seq.device.type != "cpu":
-                    input_ids_cpu = input_ids_seq.cpu()
-                else:
-                    input_ids_cpu = input_ids_seq
-
-                # Find the last image wrapper token (for the generated image)
-                positions = (input_ids_cpu == img_token_scalar).nonzero(as_tuple=True)[0]
-
-                # Debug logging (only first few calls)
-                if debug_call_count[0] <= 3:
-                    eval_logger.info(
-                        f"prefix_fn call {debug_call_count[0]}: "
-                        f"seq_len={len(input_ids_cpu)}, "
-                        f"positions found={len(positions)}, "
-                        f"looking for token {img_token_scalar}"
-                    )
-
-                if len(positions) == 0:
-                    if not debug_logged[0]:
-                        eval_logger.warning(
-                            f"img_token {img_token_scalar} not found in sequence! "
-                            f"Seq length: {len(input_ids_cpu)}, "
-                            f"Last 10 tokens: {input_ids_cpu[-10:].tolist()}"
-                        )
-                        debug_logged[0] = True
-                    return visual_tokens
-
-                position = positions[-1].item()  # Use last position for generated image
-                offset = len(input_ids_cpu) - position
-
-                # Debug: log offset periodically
-                if debug_call_count[0] <= 5 or debug_call_count[0] % 100 == 0:
-                    eval_logger.debug(
-                        f"offset={offset}, expected_end={(width + 1) * height + 3}"
-                    )
-
-                if offset % (width + 1) == 0 and eol_scalar is not None:
-                    return [eol_scalar]
-                elif offset == (width + 1) * height + 1 and eof_scalar is not None:
-                    return [eof_scalar]
-                elif offset == (width + 1) * height + 2 and eoi_scalar is not None:
-                    return [eoi_scalar]
-                elif offset == (width + 1) * height + 3 and eos_scalar is not None:
-                    return [eos_scalar]
-                elif offset > (width + 1) * height + 3 and pad_scalar is not None:
-                    return [pad_scalar]
-                else:
-                    return visual_tokens
-
-            # Step 5: Generate image tokens with progress tracking
-            # Calculate expected number of tokens for progress bar
-            # Total = h_tokens * (w_tokens + 1) + 3 (visual + EOL + EOF/EOI/EOS)
-            expected_tokens = h_tokens * (w_tokens + 1) + 3
-
-            # Create a progress bar for image generation
-            gen_pbar = tqdm(
-                total=expected_tokens,
-                desc=f"  Stage1 Image Gen (doc {doc_id})",
-                leave=False,
-                unit="tok",
-            )
-
-            # Custom streamer to track progress
-            class ProgressStreamer:
-                def __init__(self, pbar):
-                    self.pbar = pbar
-                    self.token_count = 0
-
-                def put(self, value):
-                    # value is a tensor of token IDs
-                    if hasattr(value, "shape"):
-                        new_tokens = value.shape[-1]
+                if batch_id not in offset_cache:
+                    # Find the LAST img_token position (for the generated image)
+                    positions = torch.nonzero(input_ids == img_token, as_tuple=True)[0]
+                    if len(positions) > 0:
+                        offset_cache[batch_id] = positions[-1].item()  # Use LAST position
                     else:
-                        new_tokens = 1
-                    self.token_count += new_tokens
-                    self.pbar.update(new_tokens)
+                        offset_cache[batch_id] = 0
+                    eval_logger.info(f"First call: img_token position = {offset_cache[batch_id]}, input_ids len = {input_ids.shape[0]}")
 
-                def end(self):
-                    self.pbar.close()
+                offset = input_ids.shape[0] - offset_cache[batch_id]
 
-            streamer = ProgressStreamer(gen_pbar)
+                # Log first few calls and periodically
+                if call_count[0] <= 5 or call_count[0] % 200 == 0:
+                    result_type = "eol" if offset % (w_tokens + 1) == 0 else \
+                                  "eof" if offset == (w_tokens + 1) * h_tokens + 1 else \
+                                  "eoi" if offset == (w_tokens + 1) * h_tokens + 2 else \
+                                  "eos" if offset == (w_tokens + 1) * h_tokens + 3 else \
+                                  "pad" if offset > (w_tokens + 1) * h_tokens + 3 else "visual"
+                    eval_logger.info(f"Call {call_count[0]}: offset={offset}, returning {result_type}")
+
+                if offset % (w_tokens + 1) == 0:
+                    return (eol_token,)
+                elif offset == (w_tokens + 1) * h_tokens + 1:
+                    return (eof_token,)
+                elif offset == (w_tokens + 1) * h_tokens + 2:
+                    return (eoi_token,)
+                elif offset == (w_tokens + 1) * h_tokens + 3:
+                    return (eos_token,)
+                elif offset > (w_tokens + 1) * h_tokens + 3:
+                    return (pad_token,)
+                else:
+                    return visual_tokens
+
+            # Step 5: Generate image tokens
+            eval_logger.info(f"Generating {h_tokens}x{w_tokens} image tokens...")
 
             with torch.no_grad():
                 out = self.model.generate(
@@ -567,20 +518,26 @@ class Emu3VisualCoT(lmms):
                     attention_mask=attention_mask,
                     prefix_allowed_tokens_fn=prefix_allowed_tokens_fn,
                     return_dict_in_generate=True,
-                    negative_prompt_ids=neg_input_ids,
-                    negative_prompt_attention_mask=neg_attention_mask,
-                    use_cache=False,  # Disable cache to avoid DynamicCache issues
-                    streamer=streamer,
+                    use_cache=True,  # Enable KV cache for faster generation
                 )
 
-            gen_pbar.close()
+            eval_logger.info(f"Generated {out.sequences.shape[1] - input_length} tokens")
 
             # Step 6: Decode image tokens
-            images = self.processor.decode_image_tokens(
-                out.sequences[:, input_length:],
-                height=h_tokens,
-                width=w_tokens,
-            )
+            # Extract visual tokens from generated sequence
+            generated_tokens = out.sequences[:, input_length:]
+
+            # Debug: Check what tokens were actually generated
+            unique_tokens = torch.unique(generated_tokens).tolist()
+            eval_logger.info(f"Unique generated token IDs (first 20): {unique_tokens[:20]}")
+            eval_logger.info(f"Total unique tokens: {len(unique_tokens)}")
+
+            # Check how many are visual tokens
+            visual_tokens_set = set(self.visual_tokens)
+            visual_count = sum(1 for t in generated_tokens[0] if t.item() in visual_tokens_set)
+            eval_logger.info(f"Visual tokens in generated sequence: {visual_count}/{generated_tokens.shape[1]}")
+
+            images = self._decode_image_tokens(generated_tokens, h_tokens, w_tokens)
 
             # Step 7: Save generated images
             output_images = []
@@ -714,7 +671,7 @@ class Emu3VisualCoT(lmms):
                     top_p=self.stage2_top_p if self.stage2_do_sample else None,
                     pad_token_id=self.tokenizer.pad_token_id,
                     eos_token_id=self.tokenizer.eos_token_id,
-                    use_cache=False,
+                    use_cache=True,  # Enable KV cache for faster generation
                 )
 
             # Decode

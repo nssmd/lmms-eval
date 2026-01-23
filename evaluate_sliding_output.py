@@ -5,12 +5,12 @@ Evaluate Sliding Puzzle outputs directly from model response cache.
 Usage:
     python evaluate_sliding_output.py \
         --response_file ./logs/bagel_persistent_folder/bagel_response.json \
-        --dataset_file /blob/lmms-eval-dataset/uni_mmmu_sliding54.parquet
+        --dataset_file /root/autodl-tmp/uni_mmmu_sliding54.parquet
 
 Or provide the output JSON directly:
     python evaluate_sliding_output.py \
         --response_json '{"uni_mmmu_sliding54_visual_cot___train___0": "...", ...}' \
-        --dataset_file /blob/lmms-eval-dataset/uni_mmmu_sliding54.parquet
+        --dataset_file /root/autodl-tmp/uni_mmmu_sliding54.parquet
 """
 
 import json

@@ -89,7 +89,7 @@ def test_model():
     print("=" * 60)
     
     # Use a local test image or download one
-    test_image_path = "/blob/lmms-eval-dataset/chartqa100_images/4.png"  
+    test_image_path = "/root/autodl-tmp/chartqa100_images/4.png"  
     if os.path.exists(test_image_path):
         conversation2 = [
             {"role": "user", "content": [
