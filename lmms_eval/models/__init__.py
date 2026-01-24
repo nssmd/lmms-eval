@@ -33,6 +33,7 @@ AVAILABLE_SIMPLE_MODELS = {
     "gpt4v": "GPT4V",
     "idefics2": "Idefics2",
     "illume_plus": "ILLUMEPlus",
+    "illume_plus_visual_cot": "ILLUMEPlusVisualCoT",
     "instructblip": "InstructBLIP",
     "internvideo2": "InternVideo2",
     "internvl": "InternVLChat",
@@ -107,6 +108,7 @@ AVAILABLE_SIMPLE_MODELS = {
     "whisper": "Whisper",
     "whisper_vllm": "WhisperVllm",
     "vora": "VoRA",
+    "x_omni": "XOmni",
     "unipic2": "UniPic2",
     "unipic2_visual_cot": "UniPic2VisualCoT",
 }

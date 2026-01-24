@@ -797,32 +797,67 @@ class UniPic2VisualCoT(lmms):
         for request in tqdm(requests, desc="UniPic2 CoT Reasoning"):
             contexts, gen_kwargs, doc_to_visual, doc_id, task, split = request.args
 
-            original_image = None
-            if doc_to_visual:
+            # Check if this is Uni-MMMU interleaved generation mode
+            bagel_interleaved = gen_kwargs.get("bagel_interleaved", None)
+
+            if bagel_interleaved is not None:
+                # Uni-MMMU interleaved generation mode
+                eval_logger.info(f"Uni-MMMU interleaved mode for doc {doc_id}")
+
+                # Get input images and doc data
                 doc = self.task_dict[task][split][doc_id]
-                visuals = doc_to_visual(doc)
-                if visuals: original_image = visuals[0]
+                input_images = []
+                if doc_to_visual:
+                    visuals = doc_to_visual(doc)
+                    if visuals:
+                        input_images = visuals if isinstance(visuals, list) else [visuals]
 
-            gen_prompt = self.generation_prompt_template.format(question=contexts)
-            stage1_text, gen_paths = self._stage1_generate_image(gen_prompt, doc_id, task, original_image)
+                # Generate using interleaved mode
+                final_ans, gen_paths = self.generate_uni_mmmu_interleaved(
+                    input_images, contexts, str(doc_id), task, bagel_interleaved, doc
+                )
 
-            if gen_paths:
-                final_ans = self._stage2_answer_with_image(contexts, gen_paths[0], original_image)
+                # Save intermediate artifacts if enabled
+                self._save_intermediate_artifacts(
+                    doc_id=str(doc_id),
+                    task=task,
+                    generation_prompt=f"Interleaved generation: {bagel_interleaved.get('task_type', 'unknown')}",
+                    stage1_text="",
+                    generated_images=gen_paths,
+                    question=contexts,
+                    stage2_answer=final_ans,
+                )
+
+                res.append(final_ans)
             else:
-                final_ans = ""
+                # Standard single-image generation mode
+                original_image = None
+                if doc_to_visual:
+                    doc = self.task_dict[task][split][doc_id]
+                    visuals = doc_to_visual(doc)
+                    if visuals: original_image = visuals[0]
 
-            # Save intermediate artifacts if enabled
-            self._save_intermediate_artifacts(
-                doc_id=doc_id,
-                task=task,
-                generation_prompt=gen_prompt,
-                stage1_text=stage1_text,
-                generated_images=gen_paths,
-                question=contexts,
-                stage2_answer=final_ans,
-            )
+                gen_prompt = self.generation_prompt_template.format(question=contexts)
+                stage1_text, gen_paths = self._stage1_generate_image(gen_prompt, doc_id, task, original_image)
 
-            res.append(final_ans)
+                if gen_paths:
+                    final_ans = self._stage2_answer_with_image(contexts, gen_paths[0], original_image)
+                else:
+                    final_ans = ""
+
+                # Save intermediate artifacts if enabled
+                self._save_intermediate_artifacts(
+                    doc_id=doc_id,
+                    task=task,
+                    generation_prompt=gen_prompt,
+                    stage1_text=stage1_text,
+                    generated_images=gen_paths,
+                    question=contexts,
+                    stage2_answer=final_ans,
+                )
+
+                res.append(final_ans)
+
             torch.cuda.empty_cache()
 
         return res
@@ -832,6 +867,5 @@ class UniPic2VisualCoT(lmms):
 
     def generate_until_multi_round(self, requests) -> List[str]:
         raise NotImplementedError("Multi-round not implemented.")
-
 
 

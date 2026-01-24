@@ -1,5 +1,8 @@
 import os
 from typing import List, Optional, Tuple, Union
+import re
+import time
+import sys
 
 import torch
 from accelerate import Accelerator, DistributedType
@@ -37,11 +40,15 @@ class ILLUMEPlus(lmms):
         max_new_tokens: int = 2048,
         attn_implementation: Optional[str] = "sdpa",
         device_map: Optional[str] = None,
+        infer_auto_device_map: bool = False,
+        save_intermediate: bool = False,
         **kwargs,
     ) -> None:
         super().__init__()
         assert kwargs == {}, f"Unexpected kwargs: {kwargs}"
-        
+
+        self.infer_auto_device_map = infer_auto_device_map
+        self.save_intermediate = save_intermediate
         self.device_map = device_map
 
         self.pretrained = pretrained
@@ -49,31 +56,41 @@ class ILLUMEPlus(lmms):
         self.use_cache = use_cache
         self.trust_remote_code = trust_remote_code
 
-        # Setup accelerator - only if needed for multi-GPU
-        eval_logger.info("=" * 80)
-        eval_logger.info("DEBUG: About to initialize Accelerator")
-        import os
-        eval_logger.info(f"DEBUG: RANK = {os.environ.get('RANK', 'not set')}")
-        eval_logger.info(f"DEBUG: WORLD_SIZE = {os.environ.get('WORLD_SIZE', 'not set')}")
-        eval_logger.info(f"DEBUG: LOCAL_RANK = {os.environ.get('LOCAL_RANK', 'not set')}")
-        eval_logger.info("=" * 80)
+        # Determine if we should use multi-GPU with device_map="auto"
+        # When device_map is set, we don't use Accelerator for distribution
+        self._use_device_map = device_map is not None
 
-        try:
-            accelerator = Accelerator()
-            eval_logger.info(f"DEBUG: Accelerator initialized, num_processes = {accelerator.num_processes}")
-            if accelerator.num_processes > 1:
-                self._device = torch.device(f"cuda:{accelerator.local_process_index}")
-                self._use_accelerator = True
-                self._accelerator = accelerator
-            else:
+        if self._use_device_map:
+            # Use device_map for multi-GPU (model parallelism)
+            eval_logger.info(f"Using device_map={device_map} for multi-GPU model parallelism")
+            self._device = torch.device("cuda:0")  # Primary device for inputs
+            self._use_accelerator = False
+            self._accelerator = None
+        else:
+            # Use Accelerator for data parallelism (multi-process)
+            eval_logger.info("=" * 80)
+            eval_logger.info("DEBUG: About to initialize Accelerator")
+            eval_logger.info(f"DEBUG: RANK = {os.environ.get('RANK', 'not set')}")
+            eval_logger.info(f"DEBUG: WORLD_SIZE = {os.environ.get('WORLD_SIZE', 'not set')}")
+            eval_logger.info(f"DEBUG: LOCAL_RANK = {os.environ.get('LOCAL_RANK', 'not set')}")
+            eval_logger.info("=" * 80)
+
+            try:
+                accelerator = Accelerator()
+                eval_logger.info(f"DEBUG: Accelerator initialized, num_processes = {accelerator.num_processes}")
+                if accelerator.num_processes > 1:
+                    self._device = torch.device(f"cuda:{accelerator.local_process_index}")
+                    self._use_accelerator = True
+                    self._accelerator = accelerator
+                else:
+                    self._device = torch.device(device) if isinstance(device, str) else device
+                    self._use_accelerator = False
+                    self._accelerator = None
+            except Exception as e:
+                eval_logger.warning(f"Accelerator initialization failed: {e}, using single device mode")
                 self._device = torch.device(device) if isinstance(device, str) else device
                 self._use_accelerator = False
                 self._accelerator = None
-        except Exception as e:
-            eval_logger.warning(f"Accelerator initialization failed: {e}, using single device mode")
-            self._device = torch.device(device) if isinstance(device, str) else device
-            self._use_accelerator = False
-            self._accelerator = None
 
         # Determine dtype
         if dtype == "bfloat16" or dtype == "bf16":
@@ -87,13 +104,19 @@ class ILLUMEPlus(lmms):
 
         # Load model
         eval_logger.info(f"Loading ILLUME+ model from {pretrained}")
+        eval_logger.info(f"_use_device_map={self._use_device_map}, device_map={self.device_map}")
         self._load_model(pretrained, attn_implementation)
 
         self.batch_size_per_gpu = int(batch_size)
         assert self.batch_size_per_gpu == 1, "batch_size > 1 not supported for ILLUME+"
 
-        # Setup distributed training if using accelerator
-        if self._use_accelerator and self._accelerator.num_processes > 1:
+        # Setup distributed training if using accelerator (not device_map)
+        # IMPORTANT: Do not use Accelerator when device_map is set
+        if self._use_device_map:
+            eval_logger.info("Skipping Accelerator setup because device_map is being used")
+            self._rank = 0
+            self._world_size = 1
+        elif self._use_accelerator and self._accelerator.num_processes > 1:
             distributed_type_list = [
                 DistributedType.FSDP,
                 DistributedType.MULTI_GPU,
@@ -120,16 +143,15 @@ class ILLUMEPlus(lmms):
             self._rank = 0
             self._world_size = 1
 
+        eval_logger.info(f"Final setup: rank={self._rank}, world_size={self._world_size}, use_device_map={self._use_device_map}")
         eval_logger.info("ILLUME+ model initialized successfully")
 
     def _load_model(self, pretrained: str, attn_implementation: Optional[str]):
         """Load ILLUME+ model and processor."""
         try:
             from transformers import AutoModel, AutoProcessor
-            import os
-            
+
             # Bypass torch.load security check for .bin files
-            # This is needed when PyTorch < 2.6 and model uses .bin format
             os.environ["TRANSFORMERS_ALLOW_UNSAFE_LOAD"] = "1"
 
             eval_logger.info("Loading ILLUME+ model with transformers")
@@ -137,87 +159,29 @@ class ILLUMEPlus(lmms):
             # Check if model path exists
             if os.path.exists(pretrained):
                 eval_logger.info(f"Loading from local path: {pretrained}")
-                # List files to verify
-                try:
-                    files = os.listdir(pretrained)
-                    eval_logger.info(f"Found {len(files)} files in model directory")
-                    
-                    # Check for weight files
-                    weight_files = [f for f in files if f.endswith(('.safetensors', '.bin')) and 'pytorch_model' in f]
-                    index_files = [f for f in files if f.endswith('.index.json')]
-                    
-                    eval_logger.info(f"Weight files: {weight_files}")
-                    eval_logger.info(f"Index files: {index_files}")
-                    
-                    # If index file exists but no weight files, model is incomplete
-                    if index_files and not weight_files:
-                        raise ValueError(
-                            f"Model directory {pretrained} contains index file but no weight files!\n"
-                            f"Please download the complete model weights:\n"
-                            f"  - pytorch_model-00001-of-00004.bin\n"
-                            f"  - pytorch_model-00002-of-00004.bin\n"
-                            f"  - pytorch_model-00003-of-00004.bin\n"
-                            f"  - pytorch_model-00004-of-00004.bin\n"
-                            f"Or use HuggingFace Hub: pretrained=ILLUME-MLLM/illume_plus-qwen2_5-7b-hf"
-                        )
-                except Exception as e:
-                    if "index file but no weight files" in str(e):
-                        raise
-                    eval_logger.warning(f"Could not list directory: {e}")
             else:
                 eval_logger.info(f"Loading from HuggingFace Hub: {pretrained}")
 
             # Load processor first (lightweight)
             eval_logger.info(f"Loading processor from {pretrained}")
-            eval_logger.info(f"trust_remote_code={self.trust_remote_code}")
-
-            # Add processor kwargs
+            
             processor_kwargs = {
                 "trust_remote_code": self.trust_remote_code,
             }
 
-            # Don't use local_files_only to allow transformers to properly handle custom modules
-            # The issue is that transformers needs to copy custom Python files to cache,
-            # and local_files_only can interfere with this process
-
             eval_logger.info("=" * 80)
             eval_logger.info("DEBUG: About to call AutoProcessor.from_pretrained")
-            eval_logger.info(f"DEBUG: pretrained = {pretrained}")
-            eval_logger.info(f"DEBUG: processor_kwargs = {processor_kwargs}")
-            eval_logger.info(f"DEBUG: Current process rank = {os.environ.get('RANK', 'not set')}")
-            eval_logger.info(f"DEBUG: World size = {os.environ.get('WORLD_SIZE', 'not set')}")
-            eval_logger.info(f"DEBUG: Local rank = {os.environ.get('LOCAL_RANK', 'not set')}")
-            eval_logger.info("=" * 80)
-
-            import sys
             sys.stdout.flush()
-            sys.stderr.flush()
-
-            # Load processor (this may take a few minutes for large tokenizer files)
-            eval_logger.info("DEBUG: Calling AutoProcessor.from_pretrained NOW...")
-            eval_logger.info("NOTE: Loading large tokenizer files (33MB+) may take 2-5 minutes on slow filesystems...")
-            eval_logger.info("Please be patient, the process is not hanging.")
-            sys.stdout.flush()
-            sys.stderr.flush()
 
             # Set environment variable to avoid potential hangs in custom code
             os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-            import time
             start_time = time.time()
-
             self._processor = AutoProcessor.from_pretrained(
                 pretrained, **processor_kwargs
             )
-
             elapsed = time.time() - start_time
             eval_logger.info(f"Processor loaded in {elapsed:.1f} seconds")
-
-            eval_logger.info("=" * 80)
-            eval_logger.info("DEBUG: AutoProcessor.from_pretrained returned successfully")
-            eval_logger.info("=" * 80)
-            sys.stdout.flush()
-            sys.stderr.flush()
 
             self._tokenizer = self._processor.tokenizer
             eval_logger.info("Processor loaded successfully")
@@ -226,12 +190,13 @@ class ILLUMEPlus(lmms):
             eval_logger.info(f"Loading model from {pretrained} to {self._device}")
 
             # Determine device_map strategy
-            if self.device_map is not None:
-                # User explicitly specified device_map (e.g., "auto", "balanced", etc.)
+            if self.infer_auto_device_map:
+                final_device_map = "auto"
+                eval_logger.info("Using infer_auto_device_map for multi-GPU model parallelism")
+            elif self.device_map is not None:
                 final_device_map = self.device_map
                 eval_logger.info(f"Using user-specified device_map: {final_device_map}")
             else:
-                # Default: use single device
                 final_device_map = self._device
                 eval_logger.info(f"Using single device: {final_device_map}")
 
@@ -241,15 +206,17 @@ class ILLUMEPlus(lmms):
                 "trust_remote_code": self.trust_remote_code,
                 "device_map": final_device_map,
             }
-            
-            # Don't use local_files_only for the same reason as processor
 
-            # Try with specified attn_implementation first, fallback to eager if it fails
+            # Add memory optimization when using device_map="auto"
+            if isinstance(final_device_map, str) and final_device_map in ["auto", "balanced", "balanced_low_0", "sequential"]:
+                model_kwargs["max_memory"] = {i: "38GiB" for i in range(torch.cuda.device_count())}
+                eval_logger.info(f"Setting max_memory per GPU to 38GiB for {torch.cuda.device_count()} GPUs")
+
             if attn_implementation is not None:
                 model_kwargs["attn_implementation"] = attn_implementation
-                
+
             eval_logger.info(f"Model kwargs: {model_kwargs}")
-            
+
             try:
                 self._model = AutoModel.from_pretrained(pretrained, **model_kwargs)
             except (AttributeError, ValueError) as e:
@@ -263,14 +230,18 @@ class ILLUMEPlus(lmms):
             self._model = self._model.eval()
             self._config = self._model.config
 
+            if isinstance(final_device_map, str) and final_device_map in ["auto", "balanced", "balanced_low_0", "sequential"]:
+                eval_logger.info("=" * 80)
+                eval_logger.info("Model device distribution:")
+                if hasattr(self._model, "hf_device_map"):
+                    for name, device in self._model.hf_device_map.items():
+                        eval_logger.info(f"  {name}: {device}")
+                else:
+                    eval_logger.warning("Model does not have hf_device_map attribute")
+                eval_logger.info("=" * 80)
+
             eval_logger.info("ILLUME+ model loaded successfully")
 
-        except ImportError as e:
-            raise ImportError(
-                f"Failed to import transformers. Please install it:\n"
-                f"  pip install transformers\n"
-                f"Error: {e}"
-            )
         except Exception as e:
             eval_logger.error(f"Failed to load model: {e}")
             import traceback
@@ -279,22 +250,18 @@ class ILLUMEPlus(lmms):
 
     @property
     def config(self):
-        """Return the model config."""
         return self._config
 
     @property
     def tokenizer(self):
-        """Return the tokenizer."""
         return self._tokenizer
 
     @property
     def processor(self):
-        """Return the processor."""
         return self._processor
 
     @property
     def model(self):
-        """Return the model, unwrapping it if using Accelerate."""
         if hasattr(self, "accelerator"):
             return self.accelerator.unwrap_model(self._model)
         else:
@@ -302,31 +269,25 @@ class ILLUMEPlus(lmms):
 
     @property
     def eot_token_id(self):
-        """Return the end of text token id."""
         return self.tokenizer.eos_token_id
 
     @property
     def batch_size(self):
-        """Return the batch size."""
         return self.batch_size_per_gpu
 
     @property
     def device(self):
-        """Return the device."""
         return self._device
 
     @property
     def rank(self):
-        """Return the process rank."""
         return self._rank
 
     @property
     def world_size(self):
-        """Return the world size."""
         return self._world_size
 
     def flatten(self, input_list):
-        """Flatten a nested list."""
         new_list = []
         for i in input_list:
             for j in i:
@@ -334,11 +295,9 @@ class ILLUMEPlus(lmms):
         return new_list
 
     def loglikelihood(self, requests: List[Instance]) -> List[Tuple[float, bool]]:
-        """Compute log-likelihood (not implemented for ILLUME+)."""
         raise NotImplementedError("Loglikelihood not implemented for ILLUME+")
 
     def generate_until(self, requests: List[Instance]) -> List[str]:
-        """Generate text until stopping criteria are met."""
         res = []
 
         def _collate(x):
@@ -351,7 +310,6 @@ class ILLUMEPlus(lmms):
             desc="Model Responding",
         )
 
-        # Group requests by generation kwargs
         re_ords = utils.Collator(
             [reg.args for reg in requests], _collate, grouping=True
         )
@@ -373,17 +331,13 @@ class ILLUMEPlus(lmms):
             ]
             visuals = self.flatten(visuals)
 
-            # Get generation kwargs
             gen_kwargs = all_gen_kwargs[0]
-
-            # Set default values
             if "until" in gen_kwargs:
                 gen_kwargs.pop("until")
 
             if isinstance(contexts, tuple):
                 contexts = list(contexts)
 
-            # Process each context
             assert len(contexts) == 1, "Batch size must be 1"
             context = contexts[0]
 
@@ -395,10 +349,8 @@ class ILLUMEPlus(lmms):
                 elif isinstance(visual, Image.Image):
                     visual = visual.convert("RGB")
                 elif isinstance(visual, dict):
-                    # Handle dict format - common in HuggingFace datasets
                     if "bytes" in visual:
                         from io import BytesIO
-
                         visual = Image.open(BytesIO(visual["bytes"])).convert("RGB")
                     elif "path" in visual:
                         visual = Image.open(visual["path"]).convert("RGB")
@@ -418,18 +370,26 @@ class ILLUMEPlus(lmms):
                     continue
                 images.append(visual)
 
-            # Log image processing results
             eval_logger.debug(f"Processed {len(images)} images from {len(visuals)} visuals")
 
-            # Resize images to consistent dimensions to avoid numpy array shape errors
-            # when the processor tries to stack images of different sizes
+            # Resize images to consistent dimensions
             if len(images) > 1:
                 # Find the maximum dimensions across all images
                 max_width = max(img.width for img in images)
                 max_height = max(img.height for img in images)
 
-                # Cap at a reasonable maximum to avoid memory issues
-                max_dim = 1024
+                # =================================================================
+                # [MODIFIED] Dynamic Resolution Strategy for OOM Prevention
+                # =================================================================
+                # 如果是多图（如 MMSI），强制降级到 512 以防止显存 OOM
+                # 如果是单图，保持 1024 以获得最佳细节
+                if len(images) > 1:
+                    max_dim = 512
+                    # eval_logger.debug(f"Multi-image detected ({len(images)}), clamping max_dim to {max_dim}")
+                else:
+                    max_dim = 1024
+                # =================================================================
+
                 if max_width > max_dim or max_height > max_dim:
                     scale = max_dim / max(max_width, max_height)
                     max_width = int(max_width * scale)
@@ -450,7 +410,6 @@ class ILLUMEPlus(lmms):
             top_p = gen_kwargs.get("top_p", None)
             num_beams = gen_kwargs.get("num_beams", 1)
 
-            # Generate response using ILLUME+
             try:
                 response = self._generate_response(
                     context=context,
@@ -463,18 +422,15 @@ class ILLUMEPlus(lmms):
             except Exception as e:
                 eval_logger.error(f"Generation error: {e}")
                 import traceback
-
                 eval_logger.error(traceback.format_exc())
                 response = ""
 
-            # Clean up to free memory
             torch.cuda.empty_cache()
 
             res.append(response)
             self.cache_hook.add_partial("generate_until", (context, gen_kwargs), response)
             pbar.update(1)
 
-        # Reorder results to original order
         res = re_ords.get_original(res)
         pbar.close()
         return res
@@ -488,21 +444,14 @@ class ILLUMEPlus(lmms):
         top_p: Optional[float],
         num_beams: int,
     ) -> str:
-        """Generate response using ILLUME+ model."""
         # Handle case where no images are provided
         if not images:
             eval_logger.warning("No images provided for generation, returning empty response")
             return ""
 
-        # Check if context contains image placeholders
-        # Common patterns: <image>, <img>, [image], etc.
         import re
         image_placeholder_patterns = [
-            r'<image>',
-            r'<img>',
-            r'\[image\]',
-            r'<IMAGE>',
-            r'<IMG>',
+            r'<image>', r'<img>', r'\[image\]', r'<IMAGE>', r'<IMG>',
         ]
 
         context_has_placeholders = any(
@@ -510,7 +459,6 @@ class ILLUMEPlus(lmms):
         )
 
         if context_has_placeholders:
-            # If context already has image placeholders, don't add them in conversation
             eval_logger.debug("Context contains image placeholders, using context as-is")
             conversation = [
                 {
@@ -523,7 +471,6 @@ class ILLUMEPlus(lmms):
                 },
             ]
         else:
-            # Build conversation format with image placeholders
             conversation = [
                 {
                     "role": "system",
@@ -536,20 +483,19 @@ class ILLUMEPlus(lmms):
                 },
             ]
 
-        # Log for debugging
-        eval_logger.debug(f"Processing {len(images)} images with context length {len(context)}")
-
-        # Process inputs
         inputs = self._processor(text=conversation, images=images, return_tensors="pt")
-        inputs = inputs.to(self._device)
 
-        # Prepare generation kwargs
+        if self._use_device_map:
+            target_device = "cuda:0" if torch.cuda.is_available() else "cuda"
+            inputs = inputs.to(target_device)
+        else:
+            inputs = inputs.to(self._device)
+
         generate_kwargs = {
             "max_new_tokens": max_new_tokens,
             "use_cache": self.use_cache,
         }
 
-        # Add sampling parameters
         if temperature > 0:
             generate_kwargs["do_sample"] = True
             generate_kwargs["temperature"] = temperature
@@ -561,11 +507,9 @@ class ILLUMEPlus(lmms):
         if num_beams > 1:
             generate_kwargs["num_beams"] = num_beams
 
-        # Generate response
         with torch.no_grad():
             outputs = self._model.generate(**inputs, **generate_kwargs)
 
-        # Decode response (skip input tokens)
         outputs = outputs[:, inputs["input_ids"].shape[1] :]
         answer = self._processor.batch_decode(outputs, skip_special_tokens=True)[0]
 
@@ -573,5 +517,4 @@ class ILLUMEPlus(lmms):
         return answer
 
     def generate_until_multi_round(self, requests) -> List[str]:
-        """Generate for multi-round conversations (not implemented)."""
         raise NotImplementedError("Multi-round generation not yet implemented")

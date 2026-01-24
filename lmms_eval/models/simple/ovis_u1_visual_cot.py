@@ -644,19 +644,61 @@ class OvisU1VisualCoT(lmms):
         for request in requests:
             contexts, gen_kwargs, doc_to_visual, doc_id, task, split = request.args
 
+            # Check if this is Uni-MMMU interleaved generation mode
+            bagel_interleaved = gen_kwargs.get("bagel_interleaved", None)
+
+            if bagel_interleaved is not None:
+                # Uni-MMMU interleaved generation mode
+                eval_logger.info(f"Uni-MMMU interleaved mode for doc {doc_id}")
+
+                # Get input images and doc data
+                doc = self.task_dict[task][split][doc_id]
+                input_images = []
+                if doc_to_visual:
+                    visuals = doc_to_visual(doc)
+                    if visuals:
+                        input_images = visuals if isinstance(visuals, list) else [visuals]
+
+                # Generate using interleaved mode
+                final_answer, generated_images = self.generate_uni_mmmu_interleaved(
+                    input_images, contexts, str(doc_id), task, bagel_interleaved, doc
+                )
+
+                # Build full question with image tags for metadata
+                if input_images:
+                    full_question = f"<image>{contexts}"
+                else:
+                    full_question = contexts
+
+                # Save intermediate artifacts if enabled
+                self._save_intermediate_artifacts(
+                    doc_id=str(doc_id),
+                    task=task,
+                    generation_prompt=f"Interleaved generation: {bagel_interleaved.get('task_type', 'unknown')}",
+                    stage1_text="",
+                    generated_images=generated_images,
+                    question=full_question,
+                    stage2_answer=final_answer,
+                )
+
+                res.append(final_answer)
+                pbar.update(1)
+                continue
+
+            # Standard single-image generation mode
             # Extract original image from document
             original_image = None
             if doc_to_visual is not None:
                 try:
                     # Get doc from task_dict
                     doc = self.task_dict[task][split][doc_id]
-                    
+
                     # Try doc_to_visual first
                     original_visuals = doc_to_visual(doc)
-                    
+
                     if original_visuals and len(original_visuals) > 0:
                         original_image = self._extract_image_from_various_formats(original_visuals[0])
-                    
+
                     # If doc_to_visual didn't work, try direct field access
                     if original_image is None:
                         # Try common image field names
@@ -671,12 +713,12 @@ class OvisU1VisualCoT(lmms):
                                 if original_image is not None:
                                     eval_logger.debug(f"Extracted image from doc['{field_name}']")
                                     break
-                    
+
                     if original_image is not None:
                         eval_logger.debug(f"Successfully extracted original image for doc {doc_id}")
                     else:
                         eval_logger.warning(f"No image found for doc {doc_id}")
-                        
+
                 except Exception as e:
                     import traceback
                     eval_logger.error(f"Failed to extract original image for doc {doc_id}: {e}")
