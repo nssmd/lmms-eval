@@ -231,20 +231,44 @@ class MIOVisualCoT(lmms):
             # 
             # For Visual CoT: provide original image, ask model to generate visualization
             # The model will see the original image and generate NEW image tokens
+            # 
+            # CRITICAL: Force image generation by:
+            # 1. Explicitly request in prompt
+            # 2. Pre-fill assistant response with <image> token to trigger generation
             image_placeholder = "<image_placeholder_0>"
-            prompt_with_image = f"{image_placeholder}\n{generation_prompt}"
+            prompt_with_image = f"{image_placeholder}\n{generation_prompt}\n\nPlease generate the visualization image now."
             
             eval_logger.info(f"Stage 1 - Generation prompt: {generation_prompt[:200]}...")
             eval_logger.info(f"Stage 1 - Conditional generation: providing original image as context")
+            eval_logger.info(f"Stage 1 - ⚡ Pre-filling assistant response with <image> to force generation")
 
             conversations = [[{"role": "user", "content": prompt_with_image}]]
 
             # Apply chat template WITH input images (conditional image generation)
-            inputs = self.tokenizer.apply_chat_template(
+            # Set add_generation_prompt=False so we can manually add the trigger
+            inputs_without_assistant = self.tokenizer.apply_chat_template(
                 conversations,
                 batch_image_paths=[image_paths],  # Provide original image for conditioning
                 batch_speech_paths=None,
                 mode='std',
+                padding=False,  # Don't pad yet, we'll add trigger first
+                truncation=True,
+                max_length=2048,
+                return_tensors='pt',
+                add_generation_prompt=False  # We'll add it manually with <image> trigger
+            )
+            
+            # Manually add assistant starter with <image> trigger
+            # Format: <|im_start|>assistant\n<image>
+            assistant_starter_with_trigger = "<|im_start|>assistant\n<image>"
+            
+            # Get the text sequence and append trigger
+            text_sequence = self.tokenizer.tokenizer.decode(inputs_without_assistant['input_ids'][0], skip_special_tokens=False)
+            text_sequence_with_trigger = text_sequence + "\n" + assistant_starter_with_trigger
+            
+            # Re-tokenize with trigger
+            inputs = self.tokenizer.tokenizer(
+                text_sequence_with_trigger,
                 padding=True,
                 truncation=True,
                 max_length=2048,
