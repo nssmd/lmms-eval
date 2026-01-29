@@ -52,6 +52,7 @@ class XOmniVisualCoT(lmms):
         save_intermediate: bool = False,
         intermediate_dir: Optional[str] = None,
         fail_gracefully: bool = True,
+        offload_flux_to_cpu: bool = True,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -63,6 +64,7 @@ class XOmniVisualCoT(lmms):
         self.generation_prompt_template = generation_prompt_template
         self.save_intermediate = save_intermediate
         self.fail_gracefully = fail_gracefully
+        self.offload_flux_to_cpu = offload_flux_to_cpu
 
         # Stage 1 parameters (generation)
         self.stage1_max_new_tokens = stage1_max_new_tokens
@@ -150,27 +152,29 @@ class XOmniVisualCoT(lmms):
             model_path, trust_remote_code=True
         )
 
-        # Apply regex patch for robust loading
+        # Apply regex patch for robust loading (only if method exists)
         from transformers.modeling_utils import PreTrainedModel
-        original_adjust = PreTrainedModel._adjust_missing_and_unexpected_keys
+        original_adjust = None
+        if hasattr(PreTrainedModel, '_adjust_missing_and_unexpected_keys'):
+            original_adjust = PreTrainedModel._adjust_missing_and_unexpected_keys
 
-        def safe_adjust_keys(self, *args, **kwargs):
-            try:
-                return original_adjust(self, *args, **kwargs)
-            except Exception as e:
-                eval_logger.warning(f"IGNORED Regex Error in model loading: {e}")
+            def safe_adjust_keys(self, *args, **kwargs):
+                try:
+                    return original_adjust(self, *args, **kwargs)
+                except Exception as e:
+                    eval_logger.warning(f"IGNORED Regex Error in model loading: {e}")
 
-                ret_list = []
-                for arg in args:
-                    if isinstance(arg, list):
-                        ret_list.append(arg)
+                    ret_list = []
+                    for arg in args:
+                        if isinstance(arg, list):
+                            ret_list.append(arg)
 
-                if len(ret_list) >= 2:
-                    return ret_list[0], ret_list[1]
-                else:
-                    return [], []
+                    if len(ret_list) >= 2:
+                        return ret_list[0], ret_list[1]
+                    else:
+                        return [], []
 
-        PreTrainedModel._adjust_missing_and_unexpected_keys = safe_adjust_keys
+            PreTrainedModel._adjust_missing_and_unexpected_keys = safe_adjust_keys
 
         eval_logger.info("Loading model with trust_remote_code=True...")
         try:
@@ -191,21 +195,14 @@ class XOmniVisualCoT(lmms):
             eval_logger.error(f"Failed to load model: {e}")
             raise e
         finally:
-            PreTrainedModel._adjust_missing_and_unexpected_keys = original_adjust
+            if original_adjust is not None:
+                PreTrainedModel._adjust_missing_and_unexpected_keys = original_adjust
 
         # Initialize full vision components (both encoder and decoder)
         if hasattr(self._model, "init_vision"):
             eval_logger.info(f"Initializing full vision components with FLUX path: {self.flux_pipe_path}")
-
-            # Determine vision device for multi-GPU setup
-            # Strategy: Use CPU for vision components to avoid GPU memory issues
-            # Vision components will be moved to GPU only during inference
-            eval_logger.info("Using CPU for vision components to save GPU memory")
-            eval_logger.info("Vision components will be moved to GPU on-demand during inference")
-            vision_device = "cpu"
-
-            self._model.init_vision(self.flux_pipe_path, vision_device=vision_device)
-            eval_logger.info("Vision encoder (SigLIP) and decoder (FLUX) initialized on CPU")
+            self._model.init_vision(self.flux_pipe_path)
+            eval_logger.info("Vision encoder (SigLIP) and decoder (FLUX) initialized")
         else:
             eval_logger.warning("Model does not have 'init_vision' method")
 
@@ -268,6 +265,14 @@ class XOmniVisualCoT(lmms):
             self.set_seed(self.seed)
             self.model.set_generation_mode("image")
 
+            # Move FLUX to GPU if it was offloaded
+            if self.offload_flux_to_cpu and hasattr(self.model, 'flux_pipe') and self.model.flux_pipe is not None:
+                if hasattr(self.model.flux_pipe, 'to'):
+                    eval_logger.debug("Moving FLUX to GPU for generation")
+                    self.model.flux_pipe.to('cuda:0')
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
             # Build prompt with optional image context
             if original_image is not None:
                 image_str = self.model.tokenize_image(original_image)
@@ -313,6 +318,19 @@ class XOmniVisualCoT(lmms):
                 image.save(image_path)
                 output_images.append(image_path)
                 eval_logger.info(f"Generated image saved: {image_path}")
+
+            # Clear GPU cache after generation
+            del output_ids, input_ids
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            # Offload FLUX to CPU to save GPU memory
+            if self.offload_flux_to_cpu and hasattr(self.model, 'flux_pipe') and self.model.flux_pipe is not None:
+                if hasattr(self.model.flux_pipe, 'to'):
+                    eval_logger.debug("Offloading FLUX to CPU to save GPU memory")
+                    self.model.flux_pipe.to('cpu')
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
             return output_text, output_images
 
@@ -377,6 +395,11 @@ class XOmniVisualCoT(lmms):
 
             texts, _ = self.model.mmdecode(self.tokenizer, output_ids[:, input_ids.shape[1]:-1])
             output_text = texts[0] if texts else ""
+
+            # Clear GPU cache after generation
+            del output_ids, input_ids, attention_mask, gen_img
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             return output_text
 
@@ -562,6 +585,11 @@ class XOmniVisualCoT(lmms):
 
                 texts, _ = self.model.mmdecode(self.tokenizer, output_ids[:, input_ids.shape[1]:-1])
                 final_text = texts[0] if texts else ""
+
+                # Clear GPU cache
+                del output_ids, input_ids, attention_mask, gen_img0, gen_img1
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             else:
                 final_text = ""
 
@@ -635,6 +663,11 @@ class XOmniVisualCoT(lmms):
 
                 texts, _ = self.model.mmdecode(self.tokenizer, output_ids[:, input_ids.shape[1]:-1])
                 final_text = texts[0] if texts else ""
+
+                # Clear GPU cache
+                del output_ids, input_ids, attention_mask, step_images
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             else:
                 final_text = ""
 
@@ -660,6 +693,9 @@ class XOmniVisualCoT(lmms):
                     res.append(self.response_cache[doc_uuid])
                     pbar.update(1)
                     continue
+
+            # Initialize original_image to avoid UnboundLocalError
+            original_image = None
 
             # Check if this is Uni-MMMU interleaved generation mode
             bagel_interleaved = gen_kwargs.get("bagel_interleaved", None)
@@ -696,7 +732,6 @@ class XOmniVisualCoT(lmms):
             else:
                 # Standard single-image generation mode
                 # Get original image
-                original_image = None
                 if doc_to_visual is not None:
                     visuals = self.flatten([doc_to_visual(self.task_dict[task][split][doc_id])])
                     if visuals:
@@ -736,6 +771,12 @@ class XOmniVisualCoT(lmms):
                 )
 
                 res.append(final_answer)
+
+            # Clear memory after each request
+            if original_image is not None:
+                del original_image
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             # Update cache
             if self.continual_mode:

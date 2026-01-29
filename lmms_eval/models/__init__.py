@@ -82,6 +82,7 @@ AVAILABLE_SIMPLE_MODELS = {
     "showo2_visual_cot": "Showo2VisualCoT",
     "slime": "Slime",
     "srt_api": "SRT_API",
+    "star_7b": "STAR7B",
     "tinyllava": "TinyLlava",
     "uniworld": "UniWorld",
     "uniworld_visual_cot": "UniWorldVisualCoT",
@@ -111,6 +112,7 @@ AVAILABLE_SIMPLE_MODELS = {
     "whisper_vllm": "WhisperVllm",
     "vora": "VoRA",
     "x_omni": "XOmni",
+    "x_omni_visual_cot": "XOmniVisualCoT",
     "unipic2": "UniPic2",
     "unipic2_visual_cot": "UniPic2VisualCoT",
 }

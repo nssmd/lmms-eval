@@ -9,13 +9,17 @@ Usage:
     python -m lmms_eval \
         --model illume_plus_visual_cot \
         --model_args pretrained=ILLUME-MLLM/illume_plus-qwen2_5-7b-hf \
-        --tasks mme \    
+        --tasks mme \
         --batch_size 1 \
         --device cuda:0
 """
 
-import json
+# CRITICAL: Disable flash_attn BEFORE any other imports
+# This must be done at module load time to prevent incompatible flash_attn from being loaded
 import os
+os.environ['DIFFUSERS_DISABLE_FLASH_ATTN'] = '1'
+
+import json
 import re
 import sys
 from io import BytesIO
@@ -93,6 +97,11 @@ class ILLUMEPlusVisualCoT(lmms):
     ) -> None:
         super().__init__()
         assert kwargs == {}, f"Unexpected kwargs: {kwargs}"
+
+        # Debug: Log received parameters
+        eval_logger.info(f"Initializing with tokenizer_config_path={tokenizer_config_path}")
+        eval_logger.info(f"Initializing with diffusion_decoder_path={diffusion_decoder_path}")
+        eval_logger.info(f"Initializing with enable_image_decoding={enable_image_decoding}")
 
         self.pretrained = pretrained
         self.use_cache = use_cache
@@ -236,6 +245,9 @@ class ILLUMEPlusVisualCoT(lmms):
         """Load ILLUME+ model and processor."""
         try:
             from transformers import AutoModel, AutoProcessor
+            import os
+            import sys
+            import time
 
             # Bypass torch.load security check for .bin files
             os.environ["TRANSFORMERS_ALLOW_UNSAFE_LOAD"] = "1"
@@ -282,12 +294,34 @@ class ILLUMEPlusVisualCoT(lmms):
                 "trust_remote_code": self.trust_remote_code,
             }
 
-            import time
+            # Disable flash_attn if it's causing import errors
+            # This is a workaround for version incompatibility issues
+            flash_attn_backup = sys.modules.get('flash_attn', None)
+            if 'flash_attn' in sys.modules:
+                eval_logger.warning(
+                    "Temporarily disabling flash_attn to avoid import errors. "
+                    "Model will use standard attention."
+                )
+                del sys.modules['flash_attn']
+
+            # Also set environment variable to disable flash_attn in diffusers
+            old_disable_flash = os.environ.get('DIFFUSERS_DISABLE_FLASH_ATTN')
+            os.environ['DIFFUSERS_DISABLE_FLASH_ATTN'] = '1'
 
             start_time = time.time()
-            self._processor = AutoProcessor.from_pretrained(
-                pretrained, **processor_kwargs
-            )
+            try:
+                self._processor = AutoProcessor.from_pretrained(
+                    pretrained, **processor_kwargs
+                )
+            finally:
+                # Restore flash_attn if it was there
+                if flash_attn_backup is not None:
+                    sys.modules['flash_attn'] = flash_attn_backup
+                # Restore environment variable
+                if old_disable_flash is None:
+                    os.environ.pop('DIFFUSERS_DISABLE_FLASH_ATTN', None)
+                else:
+                    os.environ['DIFFUSERS_DISABLE_FLASH_ATTN'] = old_disable_flash
             elapsed = time.time() - start_time
             eval_logger.info(f"Processor loaded in {elapsed:.1f} seconds")
 
@@ -505,52 +539,65 @@ class ILLUMEPlusVisualCoT(lmms):
         return semantic_token_num, pixel_token_num, h1, w1, h2, w2
 
     def _load_vision_decoder(self):
-        """Official HF style loading to align with the HuggingFace example."""
         try:
-            from transformers import AutoModel
             import os
+            import sys
+            from types import ModuleType
+            import importlib.machinery
+            from transformers import AutoModel
+            import transformers.utils.import_utils as import_utils
+
+            import_utils.is_flash_attn_2_available = lambda: False
 
             if not self.tokenizer_config_path:
-                eval_logger.error(
-                    "tokenizer_config_path is required for image decoding"
-                )
+                eval_logger.error("tokenizer_config_path is required for image decoding")
                 return
 
             eval_logger.info("Loading vision tokenizer via Official HF style...")
-
+            
+            model_dir = self.tokenizer_config_path
             if os.path.isfile(self.tokenizer_config_path):
                 model_dir = os.path.dirname(self.tokenizer_config_path)
-            else:
-                model_dir = self.tokenizer_config_path
 
             eval_logger.info(f"Targeting model directory: {model_dir}")
 
-            # Load model using AutoModel to trigger remote code (configuration_dualvitok.py)
-            # This automatically handles field mappings like 'out_layer' -> 'proj_layer'
-            dualvitok = (
-                AutoModel.from_pretrained(
-                    model_dir, trust_remote_code=True, torch_dtype=self._dtype
-                )
-                .to(self._device)
-                .eval()
-            )
+            flash_attn_available = False
+            try:
+                import flash_attn
+                flash_attn_available = True
+            except (ImportError, RuntimeError, ValueError):
+                eval_logger.warning("flash_attn not available or broken, creating a robust mock.")
+                
+                mock_name = 'flash_attn'
+                mock_module = ModuleType(mock_name)
+                mock_module.__spec__ = importlib.machinery.ModuleSpec(mock_name, None)
+                sys.modules[mock_name] = mock_module
 
-            # Attach vision tokenizer to the processor as per official documentation
+            try:
+                dualvitok = (
+                    AutoModel.from_pretrained(
+                        model_dir, 
+                        trust_remote_code=True, 
+                        torch_dtype=self._dtype,
+                        attn_implementation="sdpa" 
+                    )
+                    .to(self._device)
+                    .eval()
+                )
+            finally:
+                if not flash_attn_available and 'flash_attn' in sys.modules:
+                    del sys.modules['flash_attn']
+
             if hasattr(self._processor, "set_vision_tokenizer"):
                 self._processor.set_vision_tokenizer(dualvitok)
                 eval_logger.info("Vision tokenizer (DualViTok) linked to processor.")
             else:
-                eval_logger.warning(
-                    "Processor does not have set_vision_tokenizer method."
-                )
+                eval_logger.warning("Processor does not have set_vision_tokenizer method.")
 
             self.vq_model = dualvitok
 
-            # Load SDXL diffusion decoder via processor
             if self.diffusion_decoder_path:
-                eval_logger.info(
-                    f"Loading SDXL via processor: {self.diffusion_decoder_path}"
-                )
+                eval_logger.info(f"Loading SDXL via processor: {self.diffusion_decoder_path}")
                 if hasattr(self._processor, "load_diffusion_vision_detokenizer"):
                     self._processor.load_diffusion_vision_detokenizer(
                         self.diffusion_decoder_path
@@ -560,18 +607,13 @@ class ILLUMEPlusVisualCoT(lmms):
                     )
                     eval_logger.info("Diffusion decoder loaded successfully.")
                 else:
-                    eval_logger.warning(
-                        "Processor does not support load_diffusion_vision_detokenizer."
-                    )
+                    eval_logger.warning("Processor does not support load_diffusion_vision_detokenizer.")
 
-            eval_logger.info(
-                "Vision decoder initialization complete via official HF style."
-            )
+            eval_logger.info("Vision decoder initialization complete via official HF style.")
 
         except Exception as e:
             eval_logger.error(f"Failed to load via official style: {e}")
             import traceback
-
             eval_logger.error(traceback.format_exc())
 
     def _extract_image_tokens_from_text(
@@ -906,7 +948,7 @@ class ILLUMEPlusVisualCoT(lmms):
                 full_prompt = f"Generate an image of {resolution_tag}, the content of image is {generation_prompt}\n"
                 uncond_prompt = f"Generate a random image of {resolution_tag}\n"
 
-            eval_logger.info(f"Generation prompt: {full_prompt[:200]}")
+            eval_logger.info(f"Generation prompt: {full_prompt}")
             eval_logger.info(f"Unconditional prompt: {uncond_prompt[:200]}")
 
             if images:
