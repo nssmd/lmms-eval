@@ -936,16 +936,21 @@ class ILLUMEPlusVisualCoT(lmms):
 
             resolution_tag = f"<height_{h}><width_{w}>"
 
-            # Use ILLUME+ processor's official templates
-            # Note: Don't include <image> in text - it's handled by conversation structure
+            # CRITICAL: Force image generation by explicitly requesting it in the prompt
+            # Similar to MIO's approach, we make it clear that an image MUST be generated
             if images:
-                # Image editing mode
-                # The <image> will be inserted by processor based on conversation structure
-                full_prompt = f"{resolution_tag}\nPlease edit the image according to the instruction: {generation_prompt}\n"
+                # Image editing mode - explicitly request edited image output
+                full_prompt = (
+                    f"{resolution_tag}\n"
+                    f"Edit the image according to this instruction: {generation_prompt}"
+                )
                 uncond_prompt = f"{resolution_tag}\nReconstruct the image according to the given image\n"
             else:
-                # Image generation mode
-                full_prompt = f"Generate an image of {resolution_tag}, the content of image is {generation_prompt}\n"
+                # Image generation mode - explicitly request image output
+                full_prompt = (
+                    f"{resolution_tag}\n"
+                    f"Generate an image with the following content: {generation_prompt}"
+                )
                 uncond_prompt = f"Generate a random image of {resolution_tag}\n"
 
             eval_logger.info(f"Generation prompt: {full_prompt}")
@@ -1031,29 +1036,36 @@ class ILLUMEPlusVisualCoT(lmms):
             semantic_token_num, pixel_token_num, h1, w1, h2, w2 = (
                 self._calculate_image_token_dimensions(h, w)
             )
+            # CRITICAL: Calculate expected tokens and add generous buffer
+            # Format: <start_of_image> + semantic_tokens + <end_of_level0> + pixel_tokens + <end_of_image>
             expected_image_tokens = (h1 * (w1 + 1) + 2) + (h2 * (w2 + 1) + 2) + 50
+            
+            eval_logger.info(f"Expected image tokens: {expected_image_tokens} (semantic: {semantic_token_num}, pixel: {pixel_token_num})")
+            eval_logger.info(f"Token dimensions: semantic={h1}x{w1}, pixel={h2}x{w2}")
 
             # Use different parameters for image editing vs generation
             if images:
-                # Image editing parameters - use simpler settings first
+                # Image editing parameters - ensure enough tokens for full image
                 generate_kwargs = {
-                    "max_new_tokens": max(8192, expected_image_tokens + 500),
+                    "max_new_tokens": max(8192, expected_image_tokens + 1000),  # Generous buffer
                     "use_cache": self.use_cache,
                     "do_sample": True,
                     "temperature": 1.0,
                     "top_p": 1.0,
                 }
-                # Start with no CFG to test basic functionality
+                # Use moderate sampling to ensure quality
                 default_temp = 1.0
                 level0_temp = 1.0
                 level1_temp = 1.0
                 level0_top_k = 2048
                 level1_top_k = 2048 * 3
-                guidance_scale = 1.0  # Disable CFG for now
+                guidance_scale = 1.0  # Start with no CFG for stability
+                
+                eval_logger.info("Using image EDITING mode with moderate sampling")
             else:
-                # Image generation parameters
+                # Image generation parameters - ensure enough tokens for full image
                 generate_kwargs = {
-                    "max_new_tokens": max(8192, expected_image_tokens + 500),
+                    "max_new_tokens": max(8192, expected_image_tokens + 1000),  # Generous buffer
                     "use_cache": self.use_cache,
                     "do_sample": True,
                     "temperature": 0.7,
@@ -1065,6 +1077,8 @@ class ILLUMEPlusVisualCoT(lmms):
                 level0_top_k = 2048
                 level1_top_k = 6144
                 guidance_scale = 1.0
+                
+                eval_logger.info("Using image GENERATION mode with standard sampling")
 
             if self.InterleavedLogitsProcessor is None:
                 raise RuntimeError(
@@ -1134,15 +1148,56 @@ class ILLUMEPlusVisualCoT(lmms):
                 image_gen_kwargs["negative_image_prompt_ids"] = uncond_inputs["input_ids"]
                 image_gen_kwargs["negative_image_prompt_attention_mask"] = uncond_inputs.get("attention_mask", None)
 
+            # CRITICAL: Pre-fill <start_of_image> token to FORCE image generation
+            # Similar to MIO's approach of pre-filling <image> token
+            start_of_image_id = self.special_tokens_dict["start_of_image"]
+            eval_logger.info(f"Pre-filling <start_of_image> token (ID: {start_of_image_id}) to force image generation")
+            
+            # Append start_of_image token to input_ids
+            input_ids = inputs["input_ids"]
+            start_token_tensor = torch.tensor([[start_of_image_id]], dtype=input_ids.dtype, device=input_ids.device)
+            input_ids_with_trigger = torch.cat([input_ids, start_token_tensor], dim=1)
+            
+            # Update attention_mask accordingly
+            attention_mask = inputs["attention_mask"]
+            attention_mask_extended = torch.cat([attention_mask, torch.ones((attention_mask.shape[0], 1), dtype=attention_mask.dtype, device=attention_mask.device)], dim=1)
+            
+            # Update inputs dict
+            inputs["input_ids"] = input_ids_with_trigger
+            inputs["attention_mask"] = attention_mask_extended
+            
+            eval_logger.info(f"Input shape after pre-filling: {input_ids_with_trigger.shape}")
+
             with torch.no_grad():
+                eval_logger.info(f"Starting generation with max_new_tokens={generate_kwargs['max_new_tokens']}")
                 outputs = self._model.generate(**inputs, **generate_kwargs, **image_gen_kwargs)
 
             outputs_text = outputs[:, inputs["input_ids"].shape[1] :]
             generated_text = self._processor.batch_decode(
                 outputs_text, skip_special_tokens=False
             )[0]
+            
+            # Log generation statistics
+            eval_logger.info(f"Generated {outputs_text.shape[1]} tokens")
+            eval_logger.info(f"Generated text preview (first 200 chars): {generated_text[:200]}")
 
             image_tokens = self._extract_image_tokens_from_text(generated_text)
+            
+            # CRITICAL: Validate that we actually got image tokens
+            if image_tokens is None or len(image_tokens) < 2:
+                eval_logger.error(f"❌ FAILED to generate image tokens!")
+                eval_logger.error(f"Generated text: {generated_text[:500]}")
+                eval_logger.error(f"Image tokens: {image_tokens}")
+            else:
+                eval_logger.info(f"✅ Successfully generated image tokens:")
+                eval_logger.info(f"   - Semantic tokens (L0): {len(image_tokens[0])} (expected: ~{semantic_token_num})")
+                eval_logger.info(f"   - Pixel tokens (L1): {len(image_tokens[1])} (expected: ~{pixel_token_num})")
+                
+                # Validate token counts
+                if len(image_tokens[0]) < semantic_token_num * 0.8:
+                    eval_logger.warning(f"⚠️ Semantic tokens count is low: {len(image_tokens[0])} < {semantic_token_num * 0.8}")
+                if len(image_tokens[1]) < pixel_token_num * 0.8:
+                    eval_logger.warning(f"⚠️ Pixel tokens count is low: {len(image_tokens[1])} < {pixel_token_num * 0.8}")
 
             task_dir = os.path.join(self.generated_images_dir, task)
             os.makedirs(task_dir, exist_ok=True)
@@ -1157,12 +1212,18 @@ class ILLUMEPlusVisualCoT(lmms):
                 )
                 if decoded_image is not None:
                     Image.fromarray(decoded_image).save(image_path)
+                    eval_logger.info(f"✅ Successfully saved decoded image to: {image_path}")
                 else:
+                    eval_logger.warning(f"⚠️ Image decoding failed, saving gray placeholder")
                     Image.new("RGB", (h, w), color=(128, 128, 128)).save(image_path)
             else:
-                eval_logger.warning(
-                    f"No image tokens found. Preview: {generated_text[:100]}"
-                )
+                if not image_tokens:
+                    eval_logger.error(f"❌ No image tokens found in generated text!")
+                    eval_logger.error(f"Generated text preview: {generated_text[:100]}")
+                if not self.enable_image_decoding:
+                    eval_logger.warning(f"⚠️ Image decoding is disabled")
+                    
+                eval_logger.warning(f"Saving light gray placeholder image")
                 Image.new("RGB", (h, w), color=(200, 200, 200)).save(image_path)
 
             return generated_text, [image_path]
@@ -1174,44 +1235,27 @@ class ILLUMEPlusVisualCoT(lmms):
             raise
 
     def _stage2_answer_with_images(
-        self, question: str, generated_image_path: str, original_image=None
+        self, question: str, generated_image_paths: List[str], original_images: List[Image.Image] = None
     ) -> str:
-        """
-        Stage 2: Answer question using both original and generated images.
-
-        Args:
-            question: Original question text
-            generated_image_path: Path to generated auxiliary image
-            original_image: Original image (optional)
-
-        Returns:
-            Answer text
-        """
-        eval_logger.debug("Stage 2 - Answering question with images")
-        eval_logger.debug(f"Question: {question}")
-
+        eval_logger.debug("Stage 2 - Answering question with multiple images")
         try:
-            # Load images
             images = []
 
-            # Add original image first (if available)
-            if original_image:
-                original_image = self._extract_image_from_various_formats(
-                    original_image
-                )
-                if original_image:
-                    images.append(original_image)
-                    eval_logger.debug("Stage 2 - Added original image")
+            if original_images:
+                for img in original_images:
+                    extracted_img = self._extract_image_from_various_formats(img)
+                    if extracted_img:
+                        images.append(extracted_img)
 
-            # Add generated image
-            gen_image = Image.open(generated_image_path).convert("RGB")
-            images.append(gen_image)
-            eval_logger.debug("Stage 2 - Added generated image")
+            for img_path in generated_image_paths:
+                gen_image = Image.open(img_path).convert("RGB")
+                images.append(gen_image)
 
-            # Normalize image sizes to ensure consistent dimensions
+            if not images:
+                return ""
+
             images = self._normalize_image_sizes(images)
 
-            # Build conversation format
             conversation = [
                 {
                     "role": "system",
@@ -1228,24 +1272,20 @@ class ILLUMEPlusVisualCoT(lmms):
                 },
             ]
 
-            # Process inputs
             inputs = self._processor(
                 text=conversation, images=images, return_tensors="pt"
             )
 
-            # Move inputs to appropriate device
             if self.infer_auto_device_map or self.device_map == "auto":
                 inputs = inputs.to("cuda")
             else:
                 inputs = inputs.to(self._device)
 
-            # Prepare generation kwargs for stage 2
             generate_kwargs = {
                 "max_new_tokens": self.stage2_max_new_tokens,
                 "use_cache": self.use_cache,
             }
 
-            # Add sampling parameters
             if self.stage2_temperature > 0:
                 generate_kwargs["do_sample"] = True
                 generate_kwargs["temperature"] = self.stage2_temperature
@@ -1257,17 +1297,13 @@ class ILLUMEPlusVisualCoT(lmms):
             if self.stage2_num_beams > 1:
                 generate_kwargs["num_beams"] = self.stage2_num_beams
 
-            # Generate answer
             with torch.no_grad():
                 outputs = self._model.generate(**inputs, **generate_kwargs)
 
-            # Decode response (skip input tokens)
             outputs_text = outputs[:, inputs["input_ids"].shape[1] :]
             answer = self._processor.batch_decode(
                 outputs_text, skip_special_tokens=True
             )[0]
-
-            eval_logger.debug(f"Stage 2 - Generated answer: {answer[:100]}...")
 
             del outputs, inputs
             torch.cuda.empty_cache()
@@ -1276,12 +1312,10 @@ class ILLUMEPlusVisualCoT(lmms):
 
         except Exception as e:
             eval_logger.error(f"Stage 2 error: {e}")
-            import traceback
-
-            eval_logger.error(traceback.format_exc())
             if self.fail_gracefully:
                 return ""
             raise
+            
 
     def _save_intermediate_artifacts(
         self,
@@ -1583,12 +1617,6 @@ class ILLUMEPlusVisualCoT(lmms):
         return final_text, generated_images
 
     def generate_until(self, requests: List[Instance]) -> List[str]:
-        """
-        Main inference method implementing two-stage visual CoT.
-
-        Stage 1: Generate visualization image from text prompt
-        Stage 2: Answer question using both original and generated images
-        """
         res = []
 
         def _collate(x):
@@ -1621,14 +1649,9 @@ class ILLUMEPlusVisualCoT(lmms):
             contexts = contexts[0]
             gen_kwargs = all_gen_kwargs[0]
 
-            # Check if this is Uni-MMMU interleaved generation mode
             bagel_interleaved = gen_kwargs.get("bagel_interleaved", None)
 
             if bagel_interleaved is not None:
-                # Uni-MMMU interleaved generation mode
-                eval_logger.info(f"Uni-MMMU interleaved mode for doc {doc_id}")
-
-                # Get input images and doc data
                 doc = self.task_dict[task][split][doc_id]
                 input_images = []
                 if doc_to_visual[0]:
@@ -1638,16 +1661,14 @@ class ILLUMEPlusVisualCoT(lmms):
                             visuals if isinstance(visuals, list) else [visuals]
                         )
 
-                # Generate using interleaved mode
                 final_answer, generated_images = self.generate_uni_mmmu_interleaved(
                     input_images, contexts, str(doc_id), task, bagel_interleaved, doc
                 )
 
-                # Save intermediate artifacts if enabled
                 self._save_intermediate_artifacts(
                     doc_id=str(doc_id),
                     task=task,
-                    generation_prompt=f"Interleaved generation: {bagel_interleaved.get('task_type', 'unknown')}",
+                    generation_prompt=f"Interleaved generation",
                     stage1_text="",
                     generated_images=generated_images,
                     question=contexts,
@@ -1661,62 +1682,29 @@ class ILLUMEPlusVisualCoT(lmms):
                 pbar.update(1)
                 continue
 
-            # Standard generation mode
-            # Extract original images (support multiple images)
-            original_images = None
+            original_images = []
             if doc_to_visual[0]:
                 try:
                     visuals = doc_to_visual[0](self.task_dict[task][split][doc_id])
                     if visuals:
-                        # Support both single image and list of images
                         original_images = (
                             visuals if isinstance(visuals, list) else [visuals]
                         )
-                        eval_logger.debug(
-                            f"Extracted {len(original_images)} original image(s) for doc {doc_id}"
-                        )
                 except Exception as e:
-                    eval_logger.warning(
-                        f"Failed to extract original images for doc {doc_id}: {e}"
-                    )
+                    eval_logger.warning(f"Failed to extract images: {e}")
 
-            # Parse contexts to extract generation_prompt if provided
-            import re
-
-            gen_prompt_match = re.search(
-                r"\[GEN_PROMPT\](.*?)\[/GEN_PROMPT\]", contexts, re.DOTALL
-            )
-            question_match = re.search(
-                r"\[QUESTION\](.*?)\[/QUESTION\]", contexts, re.DOTALL
-            )
+            gen_prompt_match = re.search(r"\[GEN_PROMPT\](.*?)\[/GEN_PROMPT\]", contexts, re.DOTALL)
+            question_match = re.search(r"\[QUESTION\](.*?)\[/QUESTION\]", contexts, re.DOTALL)
 
             if gen_prompt_match and question_match:
-                # Use custom generation prompt from task config
                 custom_gen_prompt = gen_prompt_match.group(1).strip()
                 actual_question = question_match.group(1).strip()
-                generation_prompt = custom_gen_prompt.replace(
-                    "{question}", actual_question
-                )
-                # Update contexts to be just the question for stage 2
-                contexts = contexts.replace(
-                    f"[GEN_PROMPT]{gen_prompt_match.group(1)}[/GEN_PROMPT]", ""
-                )
-                contexts = contexts.replace(
-                    f"[QUESTION]{question_match.group(1)}[/QUESTION]",
-                    question_match.group(1),
-                )
-                eval_logger.info("Using custom generation prompt from task config")
+                generation_prompt = custom_gen_prompt.replace("{question}", actual_question)
+                contexts = contexts.replace(f"[GEN_PROMPT]{gen_prompt_match.group(1)}[/GEN_PROMPT]", "")
+                contexts = contexts.replace(f"[QUESTION]{question_match.group(1)}[/QUESTION]", question_match.group(1))
             else:
-                # Use default template
-                generation_prompt = self.generation_prompt_template.format(
-                    question=contexts
-                )
+                generation_prompt = self.generation_prompt_template.format(question=contexts)
 
-            eval_logger.info(f"\n{'=' * 60}")
-            eval_logger.info(f"Processing doc {doc_id} from task {task}")
-            eval_logger.info(f"{'=' * 60}")
-
-            # Stage 1: Generate visualization image
             stage1_text, generated_images = self._stage1_generate_image(
                 generation_prompt=generation_prompt,
                 doc_id=doc_id,
@@ -1724,20 +1712,15 @@ class ILLUMEPlusVisualCoT(lmms):
                 original_images=original_images,
             )
 
-            # Stage 2: Answer with both images
-            # Use the first original image for stage 2 (for backward compatibility)
-            original_image_for_stage2 = original_images[0] if original_images else None
             if generated_images:
                 final_answer = self._stage2_answer_with_images(
-                    contexts, generated_images[0], original_image_for_stage2
+                    question=contexts,
+                    generated_image_paths=generated_images,
+                    original_images=original_images
                 )
             else:
-                eval_logger.warning(
-                    f"No image generated for doc {doc_id}, using stage 1 text as answer"
-                )
                 final_answer = stage1_text if stage1_text else ""
 
-            # Save intermediate artifacts if enabled
             self._save_intermediate_artifacts(
                 doc_id=doc_id,
                 task=task,

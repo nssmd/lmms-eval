@@ -83,6 +83,7 @@ AVAILABLE_SIMPLE_MODELS = {
     "slime": "Slime",
     "srt_api": "SRT_API",
     "star_7b": "STAR7B",
+    "star_7b_visual_cot": "STAR7BVisualCoT",
     "tinyllava": "TinyLlava",
     "uniworld": "UniWorld",
     "uniworld_visual_cot": "UniWorldVisualCoT",
