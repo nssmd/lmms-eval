@@ -105,6 +105,8 @@ AVAILABLE_SIMPLE_MODELS = {
     "javisgpt_visual_cot": "JavisGPTVisualCoT",
     "janus_pro": "JanusPro",
     "janus_pro_visual_cot": "JanusProVisualCoT",
+    "omnigen2": "OmniGen2",
+    "omnigen2_visual_cot": "OmniGen2VisualCoT",
     "onecat": "OneCAT",
     "onecat_visual_cot": "OneCATVisualCoT",
     "tokenflow" :"TokenFlow",
@@ -114,6 +116,8 @@ AVAILABLE_SIMPLE_MODELS = {
     "vora": "VoRA",
     "x_omni": "XOmni",
     "x_omni_visual_cot": "XOmniVisualCoT",
+    "uae": "UAE",
+    "uae_visual_cot": "UAEVisualCoT",
     "unipic2": "UniPic2",
     "unipic2_visual_cot": "UniPic2VisualCoT",
 }
