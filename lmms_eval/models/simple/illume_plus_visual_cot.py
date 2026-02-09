@@ -14,14 +14,11 @@ Usage:
         --device cuda:0
 """
 
-# CRITICAL: Disable flash_attn BEFORE any other imports
-# This must be done at module load time to prevent incompatible flash_attn from being loaded
-import os
-os.environ['DIFFUSERS_DISABLE_FLASH_ATTN'] = '1'
-
 import json
+import os
 import re
 import sys
+import gc
 from io import BytesIO
 from typing import List, Optional, Tuple, Union
 
@@ -68,12 +65,12 @@ class ILLUMEPlusVisualCoT(lmms):
         device_map: Optional[str] = None,
         infer_auto_device_map: bool = False,
         # Stage 1: Image generation parameters
-        stage1_max_new_tokens: int = 4096,
+        stage1_max_new_tokens: int = 2048,
         stage1_temperature: float = 0.7,
         stage1_top_p: Optional[float] = 0.9,
         stage1_num_beams: int = 1,
         # Stage 2: Visual understanding parameters
-        stage2_max_new_tokens: int = 4096,  # Reduced from 4096 to save memory
+        stage2_max_new_tokens: int = 512,  # CRITICAL: Reduced from 2048 to avoid OOM with multiple images
         stage2_temperature: float = 0.0,
         stage2_top_p: Optional[float] = None,
         stage2_num_beams: int = 1,
@@ -295,34 +292,10 @@ class ILLUMEPlusVisualCoT(lmms):
                 "local_files_only": False,
             }
 
-            # Disable flash_attn if it's causing import errors
-            # This is a workaround for version incompatibility issues
-            flash_attn_backup = sys.modules.get('flash_attn', None)
-            if 'flash_attn' in sys.modules:
-                eval_logger.warning(
-                    "Temporarily disabling flash_attn to avoid import errors. "
-                    "Model will use standard attention."
-                )
-                del sys.modules['flash_attn']
-
-            # Also set environment variable to disable flash_attn in diffusers
-            old_disable_flash = os.environ.get('DIFFUSERS_DISABLE_FLASH_ATTN')
-            os.environ['DIFFUSERS_DISABLE_FLASH_ATTN'] = '1'
-
             start_time = time.time()
-            try:
-                self._processor = AutoProcessor.from_pretrained(
-                    pretrained, **processor_kwargs
-                )
-            finally:
-                # Restore flash_attn if it was there
-                if flash_attn_backup is not None:
-                    sys.modules['flash_attn'] = flash_attn_backup
-                # Restore environment variable
-                if old_disable_flash is None:
-                    os.environ.pop('DIFFUSERS_DISABLE_FLASH_ATTN', None)
-                else:
-                    os.environ['DIFFUSERS_DISABLE_FLASH_ATTN'] = old_disable_flash
+            self._processor = AutoProcessor.from_pretrained(
+                pretrained, **processor_kwargs
+            )
             elapsed = time.time() - start_time
             eval_logger.info(f"Processor loaded in {elapsed:.1f} seconds")
 
@@ -354,9 +327,10 @@ class ILLUMEPlusVisualCoT(lmms):
                 "low_cpu_mem_usage": True,
                 "trust_remote_code": self.trust_remote_code,
                 "device_map": final_device_map,
+                "load_in_8bit": False,  # Set to True for extreme memory saving (requires bitsandbytes)
             }
 
-            # Try with specified attn_implementation first, fallback to eager if it fails
+            # Try with specified attn_implementation first, fallback to sdpa/eager if it fails
             if attn_implementation is not None:
                 model_kwargs["attn_implementation"] = attn_implementation
 
@@ -364,19 +338,46 @@ class ILLUMEPlusVisualCoT(lmms):
 
             try:
                 self._model = AutoModel.from_pretrained(pretrained, **model_kwargs)
-            except (AttributeError, ValueError) as e:
-                if "_supports_sdpa" in str(e) or "attn_implementation" in str(e):
+            except (AttributeError, ValueError, ImportError) as e:
+                if "_supports_sdpa" in str(e) or "attn_implementation" in str(e) or "flash_attn" in str(e):
                     eval_logger.warning(
                         f"Failed to load with attn_implementation={attn_implementation}: {e}"
                     )
-                    eval_logger.warning("Retrying with attn_implementation='eager'")
-                    model_kwargs["attn_implementation"] = "eager"
-                    self._model = AutoModel.from_pretrained(pretrained, **model_kwargs)
+                    # Try sdpa first as fallback
+                    if attn_implementation != "sdpa":
+                        eval_logger.warning("Retrying with attn_implementation='sdpa'")
+                        model_kwargs["attn_implementation"] = "sdpa"
+                        try:
+                            self._model = AutoModel.from_pretrained(pretrained, **model_kwargs)
+                        except Exception as sdpa_error:
+                            eval_logger.warning(f"SDPA also failed: {sdpa_error}, falling back to 'eager'")
+                            model_kwargs["attn_implementation"] = "eager"
+                            self._model = AutoModel.from_pretrained(pretrained, **model_kwargs)
+                    else:
+                        # If sdpa failed, try eager
+                        eval_logger.warning("Retrying with attn_implementation='eager'")
+                        model_kwargs["attn_implementation"] = "eager"
+                        self._model = AutoModel.from_pretrained(pretrained, **model_kwargs)
                 else:
                     raise
 
             self._model = self._model.eval()
             self._config = self._model.config
+            
+            # MEMORY OPTIMIZATION: Enable gradient checkpointing for inference
+            # This trades computation for memory by not storing intermediate activations
+            if hasattr(self._model, 'gradient_checkpointing_enable'):
+                try:
+                    self._model.gradient_checkpointing_enable()
+                    eval_logger.info("Gradient checkpointing enabled to reduce memory usage")
+                except Exception as e:
+                    eval_logger.warning(f"Could not enable gradient checkpointing: {e}")
+
+            # Log GPU memory after model loading
+            if torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated(self._device) / 1024**3
+                reserved = torch.cuda.memory_reserved(self._device) / 1024**3
+                eval_logger.info(f"GPU Memory after model load - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
 
             eval_logger.info("ILLUME+ model loaded successfully")
 
@@ -525,6 +526,13 @@ class ILLUMEPlusVisualCoT(lmms):
             from tokenizer.dualvitok_model import RESOLUTION_MAPPING
 
             mapped_w, mapped_h = RESOLUTION_MAPPING.get((w, h), (w, h))
+            if (mapped_w, mapped_h) != (w, h):
+                eval_logger.warning(
+                    f"RESOLUTION_MAPPING changed resolution from ({w}, {h}) to ({mapped_w}, {mapped_h}). "
+                    f"This may cause OOM. Forcing original resolution."
+                )
+                # MEMORY OPTIMIZATION: Don't use mapped resolution, use original
+                mapped_w, mapped_h = w, h
         except ImportError:
             eval_logger.warning(
                 "Could not import RESOLUTION_MAPPING, using original resolution"
@@ -566,42 +574,21 @@ class ILLUMEPlusVisualCoT(lmms):
 
             eval_logger.info(f"Targeting model directory: {model_dir}")
 
-            # Mock flash_attn if not available
-            flash_attn_available = False
+            # Try to load with flash_attn if available, otherwise use sdpa
             try:
-                import flash_attn
-                flash_attn_available = True
-            except (ImportError, RuntimeError, ValueError):
-                eval_logger.warning("flash_attn not available or broken, creating a robust mock.")
-                
-                mock_name = 'flash_attn'
-                mock_module = ModuleType(mock_name)
-                mock_module.__spec__ = importlib.machinery.ModuleSpec(mock_name, None)
-                sys.modules[mock_name] = mock_module
-
-            # Mock torch_xla if not available (TPU-specific, not needed for GPU)
-            torch_xla_available = False
-            try:
-                import torch_xla
-                torch_xla_available = True
-            except (ImportError, RuntimeError, ValueError):
-                eval_logger.warning("torch_xla not available (TPU-specific), creating a mock for GPU usage.")
-                
-                mock_name = 'torch_xla'
-                mock_module = ModuleType(mock_name)
-                mock_module.__spec__ = importlib.machinery.ModuleSpec(mock_name, None)
-                sys.modules[mock_name] = mock_module
-                
-                # Also mock torch_xla.core.xla_model which might be imported
-                mock_core = ModuleType('torch_xla.core')
-                mock_core.__spec__ = importlib.machinery.ModuleSpec('torch_xla.core', None)
-                sys.modules['torch_xla.core'] = mock_core
-                
-                mock_xla_model = ModuleType('torch_xla.core.xla_model')
-                mock_xla_model.__spec__ = importlib.machinery.ModuleSpec('torch_xla.core.xla_model', None)
-                sys.modules['torch_xla.core.xla_model'] = mock_xla_model
-
-            try:
+                dualvitok = (
+                    AutoModel.from_pretrained(
+                        model_dir, 
+                        trust_remote_code=True, 
+                        torch_dtype=self._dtype,
+                        attn_implementation="flash_attention_2"  # Try flash_attn first
+                    )
+                    .to(self._device)
+                    .eval()
+                )
+                eval_logger.info("Vision tokenizer loaded with flash_attention_2")
+            except (ImportError, ValueError, RuntimeError) as e:
+                eval_logger.warning(f"Failed to load with flash_attention_2: {e}, falling back to sdpa")
                 dualvitok = (
                     AutoModel.from_pretrained(
                         model_dir, 
@@ -612,13 +599,7 @@ class ILLUMEPlusVisualCoT(lmms):
                     .to(self._device)
                     .eval()
                 )
-            finally:
-                if not flash_attn_available and 'flash_attn' in sys.modules:
-                    del sys.modules['flash_attn']
-                if not torch_xla_available:
-                    for module_name in ['torch_xla.core.xla_model', 'torch_xla.core', 'torch_xla']:
-                        if module_name in sys.modules:
-                            del sys.modules[module_name]
+                eval_logger.info("Vision tokenizer loaded with sdpa")
 
             if hasattr(self._processor, "set_vision_tokenizer"):
                 self._processor.set_vision_tokenizer(dualvitok)
@@ -627,6 +608,12 @@ class ILLUMEPlusVisualCoT(lmms):
                 eval_logger.warning("Processor does not have set_vision_tokenizer method.")
 
             self.vq_model = dualvitok
+
+            # Log GPU memory after vision tokenizer loading
+            if torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated(self._device) / 1024**3
+                reserved = torch.cuda.memory_reserved(self._device) / 1024**3
+                eval_logger.info(f"GPU Memory after vision tokenizer - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
 
             if self.diffusion_decoder_path:
                 eval_logger.info(f"Loading SDXL via processor: {self.diffusion_decoder_path}")
@@ -638,6 +625,28 @@ class ILLUMEPlusVisualCoT(lmms):
                         self._processor, "diffusion_model", None
                     )
                     eval_logger.info("Diffusion decoder loaded successfully.")
+                    
+                    # MEMORY OPTIMIZATION: Move diffusion decoder to CPU to save GPU memory
+                    # It will be moved back to GPU only when needed for decoding
+                    if hasattr(self._processor, 'diffusion_model') and self._processor.diffusion_model is not None:
+                        eval_logger.info("Moving diffusion decoder to CPU to save GPU memory...")
+                        # Move all components to CPU
+                        if hasattr(self._processor.diffusion_model, 'unet'):
+                            self._processor.diffusion_model.unet = self._processor.diffusion_model.unet.to('cpu')
+                        if hasattr(self._processor.diffusion_model, 'vae'):
+                            self._processor.diffusion_model.vae = self._processor.diffusion_model.vae.to('cpu')
+                        if hasattr(self._processor.diffusion_model, 'text_encoder'):
+                            self._processor.diffusion_model.text_encoder = self._processor.diffusion_model.text_encoder.to('cpu')
+                        if hasattr(self._processor.diffusion_model, 'text_encoder_2'):
+                            self._processor.diffusion_model.text_encoder_2 = self._processor.diffusion_model.text_encoder_2.to('cpu')
+                        torch.cuda.empty_cache()
+                        eval_logger.info("Diffusion decoder moved to CPU")
+                    
+                    # Log GPU memory after moving to CPU
+                    if torch.cuda.is_available():
+                        allocated = torch.cuda.memory_allocated(self._device) / 1024**3
+                        reserved = torch.cuda.memory_reserved(self._device) / 1024**3
+                        eval_logger.info(f"GPU Memory after moving diffusion to CPU - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
                 else:
                     eval_logger.warning("Processor does not support load_diffusion_vision_detokenizer.")
 
@@ -781,6 +790,18 @@ class ILLUMEPlusVisualCoT(lmms):
             # Decode using diffusion decoder if available
             if use_diffusion and self.diffusion_decoder_pipe is not None:
                 eval_logger.debug("Using diffusion decoder")
+                
+                # MEMORY OPTIMIZATION: Move diffusion decoder back to GPU temporarily
+                eval_logger.info("Moving diffusion decoder to GPU for decoding...")
+                if hasattr(self.diffusion_decoder_pipe, 'unet'):
+                    self.diffusion_decoder_pipe.unet = self.diffusion_decoder_pipe.unet.to(self._device)
+                if hasattr(self.diffusion_decoder_pipe, 'vae'):
+                    self.diffusion_decoder_pipe.vae = self.diffusion_decoder_pipe.vae.to(self._device)
+                if hasattr(self.diffusion_decoder_pipe, 'text_encoder'):
+                    self.diffusion_decoder_pipe.text_encoder = self.diffusion_decoder_pipe.text_encoder.to(self._device)
+                if hasattr(self.diffusion_decoder_pipe, 'text_encoder_2'):
+                    self.diffusion_decoder_pipe.text_encoder_2 = self.diffusion_decoder_pipe.text_encoder_2.to(self._device)
+                
                 diffusion_outputs = self.diffusion_decoder_pipe(
                     vq_indices=(semantic_code, pixel_code),
                     height=h * 2,
@@ -791,6 +812,18 @@ class ILLUMEPlusVisualCoT(lmms):
                 )
                 samples = diffusion_outputs.images
                 decoded_image = np.asarray(samples[0])
+                
+                # Move back to CPU to free GPU memory
+                eval_logger.info("Moving diffusion decoder back to CPU...")
+                if hasattr(self.diffusion_decoder_pipe, 'unet'):
+                    self.diffusion_decoder_pipe.unet = self.diffusion_decoder_pipe.unet.to('cpu')
+                if hasattr(self.diffusion_decoder_pipe, 'vae'):
+                    self.diffusion_decoder_pipe.vae = self.diffusion_decoder_pipe.vae.to('cpu')
+                if hasattr(self.diffusion_decoder_pipe, 'text_encoder'):
+                    self.diffusion_decoder_pipe.text_encoder = self.diffusion_decoder_pipe.text_encoder.to('cpu')
+                if hasattr(self.diffusion_decoder_pipe, 'text_encoder_2'):
+                    self.diffusion_decoder_pipe.text_encoder_2 = self.diffusion_decoder_pipe.text_encoder_2.to('cpu')
+                torch.cuda.empty_cache()
             else:
                 # Use VQ decoder
                 eval_logger.debug("Using VQ decoder")
@@ -930,10 +963,9 @@ class ILLUMEPlusVisualCoT(lmms):
                     if extracted_img is not None:
                         images.append(extracted_img)
 
-            if images:
-                h, w = images[0].size[1], images[0].size[0]
-            else:
-                h, w = 512, 512
+            # MEMORY OPTIMIZATION: Force 256x256 generation resolution
+            # Don't get resolution from input images as they will be resized
+            h, w = 256, 256
 
             # ILLUME+ only supports specific resolutions
             SUPPORTED_RESOLUTIONS = [
@@ -962,10 +994,7 @@ class ILLUMEPlusVisualCoT(lmms):
 
                 return best_resolution
 
-            # Use closest supported resolution
-            # MEMORY OPTIMIZATION: Force 256x256 for low memory situations
-            # Uncomment the line below to always use minimum resolution
-            h, w = 256, 256  # Force minimum resolution to save memory
+            # Use forced resolution for memory optimization
             # h, w = find_closest_resolution(h, w, SUPPORTED_RESOLUTIONS)
             eval_logger.info(f"Using supported resolution: {h}x{w} (forced minimum for memory optimization)")
 
@@ -1002,6 +1031,29 @@ class ILLUMEPlusVisualCoT(lmms):
 
             eval_logger.info(f"Generation prompt: {full_prompt}")
             eval_logger.info(f"Unconditional prompt: {uncond_prompt[:200]}")
+
+            # CRITICAL MEMORY OPTIMIZATION: Resize input images to reduce memory
+            # Large input images (e.g., 912x1136) cause huge vision encoder activations
+            # Resize to max 448x448 to save ~50-70% memory
+            if images:
+                from PIL import Image
+                max_input_size = 448  # Reduce from ~900-1100 to 448
+                resized_images = []
+                for img in images:
+                    img_w, img_h = img.size  # Use different variable names to avoid overwriting h, w
+                    if max(img_w, img_h) > max_input_size:
+                        # Resize maintaining aspect ratio
+                        if img_w > img_h:
+                            new_w = max_input_size
+                            new_h = int(img_h * max_input_size / img_w)
+                        else:
+                            new_h = max_input_size
+                            new_w = int(img_w * max_input_size / img_h)
+                        img = img.resize((new_w, new_h), Image.LANCZOS)
+                        eval_logger.debug(f"Resized input image from {img_w}x{img_h} to {new_w}x{new_h}")
+                    resized_images.append(img)
+                images = resized_images
+                eval_logger.info(f"Resized {len(images)} input images to max {max_input_size}px")
 
             if images:
                 if len(images) > 1:
@@ -1083,6 +1135,12 @@ class ILLUMEPlusVisualCoT(lmms):
             semantic_token_num, pixel_token_num, h1, w1, h2, w2 = (
                 self._calculate_image_token_dimensions(h, w)
             )
+            
+            # Debug: Log the actual resolution being used
+            actual_h = h1 * 28  # Reverse calculate from semantic tokens
+            actual_w = w1 * 28
+            eval_logger.info(f"Resolution check: requested=({h}, {w}), calculated from tokens=({actual_h}, {actual_w})")
+            
             # CRITICAL: Calculate expected tokens and add generous buffer
             # Format: <start_of_image> + semantic_tokens + <end_of_level0> + pixel_tokens + <end_of_image>
             expected_image_tokens = (h1 * (w1 + 1) + 2) + (h2 * (w2 + 1) + 2) + 50
@@ -1092,10 +1150,13 @@ class ILLUMEPlusVisualCoT(lmms):
 
             # Use different parameters for image editing vs generation
             if images:
-                # Image editing parameters - ensure enough tokens for full image
+                # Image editing parameters - BALANCED OPTIMIZATION
+                # Keep cache for speed, but strictly limit tokens
+                # 416 tokens needed, add minimal 20 token buffer
+                max_tokens = expected_image_tokens + 20
                 generate_kwargs = {
-                    "max_new_tokens": max(8192, expected_image_tokens + 1000),  # Generous buffer
-                    "use_cache": self.use_cache,
+                    "max_new_tokens": max_tokens,
+                    "use_cache": True,  # Keep for speed
                     "do_sample": True,
                     "temperature": 1.0,
                     "top_p": 1.0,
@@ -1106,14 +1167,15 @@ class ILLUMEPlusVisualCoT(lmms):
                 level1_temp = 1.0
                 level0_top_k = 2048
                 level1_top_k = 2048 * 3
-                guidance_scale = 1.0  # Start with no CFG for stability
+                guidance_scale = 1.0  # Disable CFG to save memory
                 
-                eval_logger.info("Using image EDITING mode with moderate sampling")
+                eval_logger.info(f"Using image EDITING mode with BALANCED optimization (max_tokens={max_tokens}, expected={expected_image_tokens})")
             else:
-                # Image generation parameters - ensure enough tokens for full image
+                # Image generation parameters - BALANCED OPTIMIZATION
+                max_tokens = expected_image_tokens + 20
                 generate_kwargs = {
-                    "max_new_tokens": max(8192, expected_image_tokens + 1000),  # Generous buffer
-                    "use_cache": self.use_cache,
+                    "max_new_tokens": max_tokens,
+                    "use_cache": True,
                     "do_sample": True,
                     "temperature": 0.7,
                     "top_p": 0.9,
@@ -1125,7 +1187,7 @@ class ILLUMEPlusVisualCoT(lmms):
                 level1_top_k = 6144
                 guidance_scale = 1.0
                 
-                eval_logger.info("Using image GENERATION mode with standard sampling")
+                eval_logger.info(f"Using image GENERATION mode with BALANCED optimization (max_tokens={max_tokens}, expected={expected_image_tokens})")
 
             if self.InterleavedLogitsProcessor is None:
                 raise RuntimeError(
@@ -1189,6 +1251,9 @@ class ILLUMEPlusVisualCoT(lmms):
                 "image_pixel_top_k": level1_top_k,
                 "image_pixel_top_p": generate_kwargs.get("top_p", 1.0),
             }
+            
+            eval_logger.info(f"image_gen_kwargs['target_image_resolution'] = {image_gen_kwargs['target_image_resolution']}")
+            eval_logger.info(f"Token grid dimensions: h1={h1}, w1={w1}, h2={h2}, w2={w2}")
 
             # Add unconditional prompt for CFG if guidance_scale > 1
             if guidance_scale > 1.0:
@@ -1215,9 +1280,78 @@ class ILLUMEPlusVisualCoT(lmms):
             
             eval_logger.info(f"Input shape after pre-filling: {input_ids_with_trigger.shape}")
 
+            # ===== MEMORY PROFILING START =====
+            def log_gpu_memory(stage_name):
+                """Log detailed GPU memory usage"""
+                if torch.cuda.is_available():
+                    allocated = torch.cuda.memory_allocated(self._device) / 1024**3
+                    reserved = torch.cuda.memory_reserved(self._device) / 1024**3
+                    max_allocated = torch.cuda.max_memory_allocated(self._device) / 1024**3
+                    eval_logger.info(f"[{stage_name}] GPU Memory - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB, Max: {max_allocated:.2f}GB")
+                    return allocated, reserved, max_allocated
+                return 0, 0, 0
+
+            # Log memory before generation
+            log_gpu_memory("Before Generation")
+            
+            # Log input tensor sizes
+            eval_logger.info(f"Input tensor sizes:")
+            for key, value in inputs.items():
+                if isinstance(value, torch.Tensor):
+                    size_mb = value.element_size() * value.nelement() / 1024**2
+                    eval_logger.info(f"  - {key}: {value.shape}, dtype={value.dtype}, size={size_mb:.2f}MB")
+            
+            # Log model parameter memory
+            total_params = sum(p.numel() for p in self._model.parameters())
+            total_param_memory = sum(p.numel() * p.element_size() for p in self._model.parameters()) / 1024**3
+            eval_logger.info(f"Model parameters: {total_params:,} ({total_param_memory:.2f}GB)")
+
             with torch.no_grad():
-                eval_logger.info(f"Starting generation with max_new_tokens={generate_kwargs['max_new_tokens']}")
-                outputs = self._model.generate(**inputs, **generate_kwargs, **image_gen_kwargs)
+                eval_logger.info(f"Starting generation with max_new_tokens={generate_kwargs['max_new_tokens']}, use_cache={generate_kwargs['use_cache']}")
+                
+                # EXTREME MEMORY OPTIMIZATION: Aggressive cache clearing
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                    # Force garbage collection
+                    import gc
+                    gc.collect()
+                    
+                log_gpu_memory("After Aggressive Cache Clear")
+                
+                try:
+                    outputs = self._model.generate(**inputs, **generate_kwargs, **image_gen_kwargs)
+                    log_gpu_memory("After Generation Success")
+                except RuntimeError as e:
+                    log_gpu_memory("At OOM Error")
+                    eval_logger.error(f"Generation failed with error: {e}")
+                    
+                    # Log KV cache size estimate
+                    batch_size = inputs["input_ids"].shape[0]
+                    seq_len = inputs["input_ids"].shape[1]
+                    max_new = generate_kwargs['max_new_tokens']
+                    total_seq_len = seq_len + max_new
+                    
+                    # Estimate KV cache size (rough calculation)
+                    # For each layer: 2 (K+V) * batch * num_heads * seq_len * head_dim * dtype_size
+                    if hasattr(self._model.config, 'num_hidden_layers'):
+                        num_layers = self._model.config.num_hidden_layers
+                        hidden_size = self._model.config.hidden_size
+                        num_heads = self._model.config.num_attention_heads
+                        head_dim = hidden_size // num_heads
+                        dtype_size = 2 if self._dtype == torch.float16 or self._dtype == torch.bfloat16 else 4
+                        
+                        if generate_kwargs['use_cache']:
+                            kv_cache_size = 2 * batch_size * num_layers * num_heads * total_seq_len * head_dim * dtype_size / 1024**3
+                            eval_logger.error(f"Estimated KV cache size: {kv_cache_size:.2f}GB")
+                        else:
+                            eval_logger.error(f"KV cache is DISABLED (use_cache=False)")
+                        eval_logger.error(f"  - Layers: {num_layers}, Heads: {num_heads}, Head dim: {head_dim}")
+                        eval_logger.error(f"  - Sequence length: {seq_len} + {max_new} = {total_seq_len}")
+                        eval_logger.error(f"  - Batch size: {batch_size}")
+                    
+                    raise
+            # ===== MEMORY PROFILING END =====
 
             outputs_text = outputs[:, inputs["input_ids"].shape[1] :]
             generated_text = self._processor.batch_decode(
@@ -1290,7 +1424,27 @@ class ILLUMEPlusVisualCoT(lmms):
         self, question: str, generated_image_paths: List[str], original_images: List[Image.Image] = None, task: str = None
     ) -> str:
         eval_logger.debug("Stage 2 - Answering question with multiple images")
+        
+        # Define local memory logging function
+        def log_gpu_memory(stage_name):
+            """Log detailed GPU memory usage"""
+            if torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated(self._device) / 1024**3
+                reserved = torch.cuda.memory_reserved(self._device) / 1024**3
+                max_allocated = torch.cuda.max_memory_allocated(self._device) / 1024**3
+                eval_logger.info(f"[{stage_name}] GPU Memory - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB, Max: {max_allocated:.2f}GB")
+                return allocated, reserved, max_allocated
+            return 0, 0, 0
+        
         try:
+            # CRITICAL: Aggressive memory cleanup before Stage 2
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                gc.collect()
+            
+            log_gpu_memory("Stage 2 Start - After Cleanup")
+            
             # CRITICAL FIX for geometry3k_visual_cot: Remove <image> tags from question
             # Same issue as Stage 1 - images are provided through conversation structure
             if task == "geometry3k_visual_cot":
@@ -1314,7 +1468,22 @@ class ILLUMEPlusVisualCoT(lmms):
             if not images:
                 return ""
 
-            images = self._normalize_image_sizes(images)
+            # CRITICAL: Resize images to reduce memory for Stage 2
+            # Stage 2 doesn't need high resolution - it's just answering questions
+            max_size = 448  # Match Stage 1 input size
+            resized_images = []
+            for img in images:
+                w, h = img.size
+                if max(w, h) > max_size:
+                    scale = max_size / max(w, h)
+                    new_w = int(w * scale)
+                    new_h = int(h * scale)
+                    img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                resized_images.append(img)
+            
+            eval_logger.info(f"Stage 2: Processing {len(resized_images)} images (resized to max {max_size}px)")
+            
+            images = self._normalize_image_sizes(resized_images)
 
             conversation = [
                 {
@@ -1341,9 +1510,11 @@ class ILLUMEPlusVisualCoT(lmms):
             else:
                 inputs = inputs.to(self._device)
 
+            log_gpu_memory("Stage 2 After Input Preparation")
+
             generate_kwargs = {
                 "max_new_tokens": self.stage2_max_new_tokens,
-                "use_cache": self.use_cache,
+                "use_cache": False,  # CRITICAL: Disable cache for Stage 2 to save memory
             }
 
             if self.stage2_temperature > 0:
@@ -1357,16 +1528,24 @@ class ILLUMEPlusVisualCoT(lmms):
             if self.stage2_num_beams > 1:
                 generate_kwargs["num_beams"] = self.stage2_num_beams
 
+            eval_logger.info(f"Stage 2: Starting generation with {len(images)} images, max_new_tokens={self.stage2_max_new_tokens}, use_cache=False")
+
             with torch.no_grad():
                 outputs = self._model.generate(**inputs, **generate_kwargs)
+
+            log_gpu_memory("Stage 2 After Generation")
 
             outputs_text = outputs[:, inputs["input_ids"].shape[1] :]
             answer = self._processor.batch_decode(
                 outputs_text, skip_special_tokens=True
             )[0]
 
-            del outputs, inputs
-            torch.cuda.empty_cache()
+            # Aggressive cleanup
+            del outputs, outputs_text, inputs, images, resized_images
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            gc.collect()
 
             return answer
 
@@ -1518,67 +1697,18 @@ class ILLUMEPlusVisualCoT(lmms):
             )
             final_question = prompt + "\n\n" + final_suffix
 
-            # Use custom stage 2 logic with multiple images
+            # Use optimized stage 2 method
             if len(generated_images) >= 2:
-                # Load both generated images
-                gen_img0 = Image.open(generated_images[0]).convert("RGB")
-                gen_img1 = Image.open(generated_images[1]).convert("RGB")
-
-                # Build images list: original images + generated images
-                images = []
-                if original_images:
-                    images.extend(original_images)  # Add all original images
-                images.extend([gen_img0, gen_img1])  # Add generated images
-
-                # Normalize image sizes to ensure consistent dimensions
-                images = self._normalize_image_sizes(images)
-
-                # Build conversation format
-                conversation = [
-                    {
-                        "role": "system",
-                        "content": [
-                            {"type": "text", "text": "You are a helpful assistant."}
-                        ],
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            [{"type": "image"}] * len(images)
-                            + [{"type": "text", "text": final_question}]
-                        ),
-                    },
-                ]
-
-                # Process inputs
-                inputs = self._processor(
-                    text=conversation, images=images, return_tensors="pt"
+                # Combine original images with generated images
+                all_images = list(original_images) if original_images else []
+                all_images.extend(generated_images)
+                
+                final_text = self._stage2_answer_with_images(
+                    question=final_question,
+                    generated_image_paths=generated_images,
+                    original_images=original_images,
+                    task=task
                 )
-
-                # Move inputs to appropriate device
-                if self.infer_auto_device_map or self.device_map == "auto":
-                    inputs = inputs.to("cuda")
-                else:
-                    inputs = inputs.to(self._device)
-
-                # Generate answer
-                with torch.no_grad():
-                    output_ids = self._model.generate(
-                        **inputs,
-                        max_new_tokens=self.stage2_max_new_tokens,
-                        do_sample=False,
-                    )
-
-                # Decode output
-                input_len = inputs["input_ids"].shape[1]
-                generated_ids = output_ids[0][input_len:]
-                final_text = self.tokenizer.decode(
-                    generated_ids, skip_special_tokens=True
-                )
-
-                # Clean up
-                del inputs, output_ids, generated_ids
-                torch.cuda.empty_cache()
             else:
                 final_text = ""
 
@@ -1611,68 +1741,14 @@ class ILLUMEPlusVisualCoT(lmms):
             )
             final_question = prompt + "\n\n" + final_suffix
 
-            # Use custom stage 2 logic with all step images
+            # Use optimized stage 2 method
             if generated_images:
-                # Load all generated images
-                step_images = [
-                    Image.open(img_path).convert("RGB") for img_path in generated_images
-                ]
-
-                # Build images list: original images + generated step images
-                images = []
-                if original_images:
-                    images.extend(original_images)  # Add all original images
-                images.extend(step_images)  # Add generated step images
-
-                # Normalize image sizes to ensure consistent dimensions
-                images = self._normalize_image_sizes(images)
-
-                # Build conversation format
-                conversation = [
-                    {
-                        "role": "system",
-                        "content": [
-                            {"type": "text", "text": "You are a helpful assistant."}
-                        ],
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            [{"type": "image"}] * len(images)
-                            + [{"type": "text", "text": final_question}]
-                        ),
-                    },
-                ]
-
-                # Process inputs
-                inputs = self._processor(
-                    text=conversation, images=images, return_tensors="pt"
+                final_text = self._stage2_answer_with_images(
+                    question=final_question,
+                    generated_image_paths=generated_images,
+                    original_images=original_images,
+                    task=task
                 )
-
-                # Move inputs to appropriate device
-                if self.infer_auto_device_map or self.device_map == "auto":
-                    inputs = inputs.to("cuda")
-                else:
-                    inputs = inputs.to(self._device)
-
-                # Generate answer
-                with torch.no_grad():
-                    output_ids = self._model.generate(
-                        **inputs,
-                        max_new_tokens=self.stage2_max_new_tokens,
-                        do_sample=False,
-                    )
-
-                # Decode output
-                input_len = inputs["input_ids"].shape[1]
-                generated_ids = output_ids[0][input_len:]
-                final_text = self.tokenizer.decode(
-                    generated_ids, skip_special_tokens=True
-                )
-
-                # Clean up
-                del inputs, output_ids, generated_ids
-                torch.cuda.empty_cache()
             else:
                 final_text = ""
 
