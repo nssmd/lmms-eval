@@ -86,7 +86,7 @@ class AzureTRAPIVisualCoT(lmms):
     def __init__(
         self,
         timeout: int = 120,
-        max_retries: int = 3,
+        max_retries: int = 999,
         # Deployment names
         chat_deployment: str = None,
         image_deployment: str = None,
