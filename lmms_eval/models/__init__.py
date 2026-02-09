@@ -15,6 +15,7 @@ logger.add(sys.stdout, level="WARNING", format=log_format)
 
 AVAILABLE_SIMPLE_MODELS = {
     "aero": "Aero",
+    "aia": "AIA",
     "azure_trapi": "AzureTRAPI",
     "azure_trapi_visual_cot": "AzureTRAPIVisualCoT",
     "plm": "PerceptionLM",
@@ -120,6 +121,9 @@ AVAILABLE_SIMPLE_MODELS = {
     "uae_visual_cot": "UAEVisualCoT",
     "unipic2": "UniPic2",
     "unipic2_visual_cot": "UniPic2VisualCoT",
+    "univideo": "UniVideo",
+    "univideo_visual_cot": "UniVideoVisualCoT",
+    "yi_vl": "YiVL",
 }
 
 AVAILABLE_CHAT_TEMPLATE_MODELS = {

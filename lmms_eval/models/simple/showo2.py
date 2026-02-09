@@ -216,7 +216,7 @@ class Showo2(lmms):
         if self.vae_model_path is None:
             # Try to find VAE in common locations
             possible_paths = [
-                "/scratch/azureml/cr/j/efa7581894b5472d91a754c6d79cc125/exe/wd/jxlei/models/Wan2.1-T2V-14B/Wan2.1_VAE.pth",
+                "/home/aiscuser/data/jxlei/models/Wan2.1-T2V-14B/Wan2.1_VAE.pth",
                 os.path.join(str(wd), "models", "Wan2.1-T2V-14B", "Wan2.1_VAE.pth"),
             ]
             for path in possible_paths:
@@ -712,6 +712,184 @@ class Showo2(lmms):
             output_images.append(image_path)
             eval_logger.info(f"Saved image: {image_path}")
 
+        return "", output_images
+
+    def generate_image_with_conditioning(
+        self, prompt: str, conditioning_image: Image.Image, doc_id: str, task: str
+    ) -> Tuple[str, List[str]]:
+        """
+        Generate image from text prompt conditioned on an input image (i2i generation)
+
+        Args:
+            prompt: Input text prompt
+            conditioning_image: Input image to condition on
+            doc_id: Document ID for file naming
+            task: Task name for file naming
+
+        Returns:
+            Tuple of (empty_text, list_of_image_paths)
+        """
+        eval_logger.info("=" * 80)
+        eval_logger.info(f"[SHOW-O2 I2I] Doc: {doc_id} | Task: {task}")
+        eval_logger.info("=" * 80)
+        eval_logger.info(f"[SHOW-O2 I2I] ✓ Conditioning image provided: {conditioning_image.size}")
+        eval_logger.info(f"[SHOW-O2 I2I] Text prompt: {prompt[:100]}...")
+
+        self.set_seed(self.seed)
+
+        from models.misc import prepare_mixed_modal_gen_input
+
+        # Step 1: Encode conditioning image to latents
+        eval_logger.info(f"[SHOW-O2 I2I] Step 1: Encoding conditioning image...")
+        image_tensor = self.image_transform(
+            conditioning_image.convert("RGB"), resolution=self.resolution
+        ).to(self.device)
+        image_tensor = image_tensor.unsqueeze(0)
+
+        # Encode with VAE
+        conditioning_latents = (
+            self.vae_model.sample(image_tensor.unsqueeze(2))
+            .squeeze(2)
+            .to(self.weight_type)
+        )
+        eval_logger.info(f"[SHOW-O2 I2I]   - Conditioning latents shape: {conditioning_latents.shape}")
+
+        # Step 2: Prepare text input for mixed modality generation
+        # CRITICAL: Text must reference the conditioning image via placeholder tokens
+        eval_logger.info(f"[SHOW-O2 I2I] Step 2: Preparing mixed modality text input...")
+
+        # Construct text with image reference at the beginning
+        # This tells the model: "there's a conditioning image, then generate based on this prompt"
+        image_placeholder = "<|image_pad|>" * self.num_t2i_image_tokens
+        text_with_image_ref = image_placeholder + prompt
+
+        eval_logger.info(f"[SHOW-O2 I2I]   - Text includes {self.num_t2i_image_tokens} image placeholder tokens")
+        eval_logger.info(f"[SHOW-O2 I2I]   - Text format: <image_pad>*{self.num_t2i_image_tokens} + prompt")
+
+        batch_text_tokens, batch_text_tokens_null, batch_modality_positions, batch_modality_positions_null = (
+            prepare_mixed_modal_gen_input(
+                [text_with_image_ref],
+                [""],  # Null prompt for CFG
+                self.text_tokenizer,
+                self.num_t2i_image_tokens,
+                self.bos_id,
+                self.boi_id,
+                self.eoi_id,
+                self.pad_id,
+                self.img_pad_id,
+                self.device,
+            )
+        )
+
+        # Step 3: Initialize noise for new image generation
+        eval_logger.info(f"[SHOW-O2 I2I] Step 3: Initializing noise...")
+        z_new = torch.randn(
+            (
+                1,
+                self.image_latent_dim,
+                self.latent_height * self.patch_size,
+                self.latent_width * self.patch_size,
+            )
+        ).to(torch.bfloat16).to(self.device)
+
+        # Step 4: Concatenate conditioning latents with new noise
+        eval_logger.info(f"[SHOW-O2 I2I] Step 4: Concatenating conditioning image with new generation...")
+        # Concatenate along batch dimension: [conditioning_image, new_image]
+        z = torch.cat([conditioning_latents, z_new], dim=0)
+        eval_logger.info(f"[SHOW-O2 I2I]   - Combined latents shape: {z.shape}")
+
+        # Step 5: Prepare modality positions for mixed modality (2 images)
+        # modality_positions describes each image's position in the sequence
+        # For 2 images, we need to concatenate along dim=1
+        eval_logger.info(f"[SHOW-O2 I2I] Step 5: Preparing modality positions for mixed modality...")
+        eval_logger.info(f"[SHOW-O2 I2I]   - Original modality_positions shape: {batch_modality_positions.shape}")
+        eval_logger.info(f"[SHOW-O2 I2I]   - z shape (conditioning + new): {z.shape}")
+
+        # Concatenate modality positions along dim=1 to describe both images
+        # batch_modality_positions: [1, 1, 2] -> [1, 2, 2] for 2 images
+        batch_modality_positions_mixed = torch.cat([batch_modality_positions, batch_modality_positions], dim=1)
+        batch_modality_positions_null_mixed = torch.cat([batch_modality_positions_null, batch_modality_positions_null], dim=1)
+
+        eval_logger.info(f"[SHOW-O2 I2I]   - Mixed modality_positions shape: {batch_modality_positions_mixed.shape}")
+
+        # Step 6: Prepare for CFG (classifier-free guidance)
+        if self.guidance_scale > 0:
+            eval_logger.info(f"[SHOW-O2 I2I] Step 6: Preparing for CFG...")
+            # For CFG, clone the latents (not random noise!)
+            z_null = z.clone()
+            z = torch.cat([z, z_null], dim=0)
+
+            text_tokens = torch.cat(
+                [batch_text_tokens, batch_text_tokens_null], dim=0
+            )
+
+            modality_positions = torch.cat(
+                [batch_modality_positions_mixed, batch_modality_positions_null_mixed], dim=0
+            )
+            eval_logger.info(f"[SHOW-O2 I2I]   - With CFG - z shape: {z.shape}")
+            eval_logger.info(f"[SHOW-O2 I2I]   - With CFG - text_tokens shape: {text_tokens.shape}")
+            eval_logger.info(f"[SHOW-O2 I2I]   - With CFG - modality_positions shape: {modality_positions.shape}")
+        else:
+            text_tokens = batch_text_tokens
+            modality_positions = batch_modality_positions_mixed
+
+        eval_logger.info(f"[SHOW-O2 I2I] Step 7: Preparing attention mask...")
+        block_mask = self.omni_attn_mask_naive(
+            text_tokens.size(0),
+            text_tokens.size(1),  # Use actual sequence length from text_tokens
+            modality_positions,
+            self.device,
+        ).to(self.weight_type)
+
+        model_kwargs = dict(
+            text_tokens=text_tokens,
+            attention_mask=block_mask,
+            modality_positions=modality_positions,
+            output_hidden_states=True,
+            max_seq_len=text_tokens.size(1),
+            guidance_scale=self.guidance_scale,
+            only_denoise_last_image=True,  # Only generate the new image, keep conditioning fixed
+        )
+
+        eval_logger.info(f"[SHOW-O2 I2I] Step 8: Running diffusion sampling...")
+        sample_fn = self.sampler.sample_ode(
+            sampling_method="euler",
+            num_steps=self.num_inference_steps,
+            atol=1e-6,
+            rtol=1e-3,
+            reverse=False,
+            time_shifting_factor=3.0,
+        )
+        samples = sample_fn(z, self.model.t2i_generate, **model_kwargs)[-1]
+
+        # Extract only the newly generated image (second image in the batch)
+        if self.guidance_scale > 0:
+            samples = torch.chunk(samples, 2)[0]  # Remove null samples
+
+        # Get the second image (index 1) which is the newly generated one
+        samples = samples[1:2]  # Keep only the new image
+        eval_logger.info(f"[SHOW-O2 I2I]   - Generated samples shape: {samples.shape}")
+
+        # Step 9: Decode with VAE
+        eval_logger.info(f"[SHOW-O2 I2I] Step 9: Decoding with VAE...")
+        samples = samples.unsqueeze(2)
+        images = self.vae_model.batch_decode(samples)
+        images = images.squeeze(2)
+
+        # Convert to PIL images
+        images = self.denorm(images)
+        pil_images = [Image.fromarray(img) for img in images]
+
+        # Save images
+        output_images = []
+        for i, pil_image in enumerate(pil_images):
+            safe_filename = f"{task}_{doc_id}_{i}.png"
+            image_path = os.path.join(self.output_image_dir, safe_filename)
+            pil_image.save(image_path)
+            output_images.append(image_path)
+            eval_logger.info(f"[SHOW-O2 I2I] ✓ Saved image: {image_path}")
+
+        eval_logger.info("=" * 80)
         return "", output_images
 
     def format_output(self, text: str, images: List[str]) -> str:
