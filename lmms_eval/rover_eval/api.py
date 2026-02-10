@@ -111,7 +111,15 @@ def call_gpt4o_with_images(
     content = [{"type": "text", "text": prompt}]
 
     if images:
+        # Flatten nested lists (in case original_image is a list)
+        flat_images = []
         for img in images:
+            if isinstance(img, list):
+                flat_images.extend(img)
+            else:
+                flat_images.append(img)
+        
+        for img in flat_images:
             img_b64 = encode_image_to_base64(img)
             if img_b64:
                 content.append({
