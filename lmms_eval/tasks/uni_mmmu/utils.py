@@ -375,6 +375,16 @@ def sliding_process_results(doc: Dict, results: List[str]) -> Dict[str, float]:
     gt_moves = json.loads(gt_moves_str) if isinstance(gt_moves_str, str) else gt_moves_str
     gt_moves = [str(m).lower() for m in gt_moves]
 
+    # Convert ground truth moves: swap up<->down, left<->right
+    # This is needed because the coordinate system in the dataset may differ from model's understanding
+    direction_map = {
+        "up": "down",
+        "down": "up",
+        "left": "right",
+        "right": "left"
+    }
+    gt_moves = [direction_map.get(m, m) for m in gt_moves]
+
     # Text evaluation
     text_exact = 1 if pred_moves == gt_moves else 0
     text_frame_acc = (

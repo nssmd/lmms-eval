@@ -42,6 +42,7 @@ AVAILABLE_SIMPLE_MODELS = {
     "internvl2": "InternVL2",
     "llama_vid": "LLaMAVid",
     "llama_vision": "LlamaVision",
+    "llada": "LLaDA",
     "llava": "Llava",
     "llava_hf": "LlavaHf",
     "llava_onevision": "Llava_OneVision",

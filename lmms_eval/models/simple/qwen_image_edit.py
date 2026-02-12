@@ -40,28 +40,30 @@ class QwenImageEdit(lmms):
         pretrained: str = "Qwen/Qwen2-VL-7B-Instruct",  # Qwen2.5-VL for understanding
         mode: str = "understanding",  # "understanding" or "editing"
         device: Optional[str] = "cuda",
-        device_map: Optional[str] = "auto",
+        device_map: Optional[str] = "cuda",  # Changed from "auto" to "cuda" for single GPU
         batch_size: Optional[Union[int, str]] = 1,
         torch_dtype: str = "bfloat16",
         # Understanding mode parameters
         max_pixels: int = 1605632,
         min_pixels: int = 256 * 28 * 28,
         system_prompt: str = "You are a helpful assistant.",
-        # Editing mode parameters  
+        # Editing mode parameters
         num_inference_steps: int = 50,
         guidance_scale: float = 7.5,
         output_type: str = "pil",
         save_generated_images: bool = True,
         generated_image_dir: str = "./qwen_edit_generated_images",
+        # Shared accelerator to avoid multiple initializations
+        accelerator: Optional[Accelerator] = None,
         **kwargs,
     ) -> None:
         super().__init__()
-        
+
         # Validate mode
         if mode not in ["understanding", "editing"]:
             raise ValueError(f"mode must be 'understanding' or 'editing', got {mode}")
         self.mode = mode
-        
+
         # Validate torch dtype
         dtype_mapping = {
             "float32": torch.float32,
@@ -72,8 +74,11 @@ class QwenImageEdit(lmms):
             raise ValueError(f"torch_dtype must be one of {list(dtype_mapping.keys())}, got {torch_dtype}")
         self.torch_dtype = dtype_mapping[torch_dtype]
 
-        accelerator = Accelerator()
-        self.accelerator = accelerator
+        # Use provided accelerator or create new one
+        if accelerator is not None:
+            self.accelerator = accelerator
+        else:
+            self.accelerator = Accelerator()
         
         if accelerator.num_processes > 1:
             self._device = torch.device(f"cuda:{accelerator.local_process_index}")
@@ -107,9 +112,8 @@ class QwenImageEdit(lmms):
                 self.pipeline = DiffusionPipeline.from_pretrained(
                     pretrained,
                     torch_dtype=self.torch_dtype,
-                    device_map=self.device_map,
                     use_safetensors=True,
-                )
+                ).to(self._device)
                 eval_logger.info(f"Successfully loaded Qwen-Image-Edit pipeline for editing mode")
             except Exception as e:
                 eval_logger.error(f"Failed to load Qwen-Image-Edit: {e}")

@@ -53,6 +53,8 @@ class QwenImageEditVisualCoT(lmms):
         fail_gracefully: bool = True,
         **kwargs,
     ) -> None:
+        # Initialize task_dict before super().__init__() to avoid AttributeError
+        self._task_dict = {}
         super().__init__()
 
         self.pretrained_edit = pretrained_edit
@@ -95,6 +97,11 @@ class QwenImageEditVisualCoT(lmms):
     def _load_models(self):
         """Load both editing and understanding models"""
         from lmms_eval.models.simple.qwen_image_edit import QwenImageEdit
+        from accelerate import Accelerator
+
+        # Create a shared accelerator to avoid multiple initializations
+        shared_accelerator = Accelerator()
+        eval_logger.info("Created shared Accelerator for both models")
 
         # Stage 1: Editing model
         eval_logger.info(f"Loading editing model: {self.pretrained_edit}")
@@ -105,6 +112,7 @@ class QwenImageEditVisualCoT(lmms):
             guidance_scale=self.stage1_guidance_scale,
             save_generated_images=True,
             generated_image_dir=os.path.join(self.intermediate_dir, "stage1_images"),
+            accelerator=shared_accelerator,
         )
 
         # Stage 2: Understanding model
@@ -114,6 +122,7 @@ class QwenImageEditVisualCoT(lmms):
             mode="understanding",
             max_pixels=self.stage2_max_pixels,
             min_pixels=self.stage2_min_pixels,
+            accelerator=shared_accelerator,
         )
 
         eval_logger.info("Both models loaded successfully")
@@ -133,6 +142,21 @@ class QwenImageEditVisualCoT(lmms):
     @property
     def tokenizer(self):
         return self.understand_model.tokenizer
+
+    @property
+    def task_dict(self):
+        # Return understand_model's task_dict if available, otherwise use internal _task_dict
+        if hasattr(self, 'understand_model') and self.understand_model is not None:
+            return self.understand_model.task_dict
+        return self._task_dict
+
+    @task_dict.setter
+    def task_dict(self, value):
+        # Store in internal _task_dict
+        self._task_dict = value
+        # Sync to understand_model if it exists
+        if hasattr(self, 'understand_model') and self.understand_model is not None:
+            self.understand_model.task_dict = value
 
     def _stage1_generate_image(
         self, generation_prompt: str, doc_id: str, task: str, original_image: Image.Image
@@ -214,8 +238,13 @@ class QwenImageEditVisualCoT(lmms):
             if not os.path.exists(image_path):
                 eval_logger.warning(f"Generated image not found: {image_path}")
                 return ""
-                
+
             auxiliary_image = Image.open(image_path).convert("RGB")
+
+            # Capture stage2 parameters from outer scope
+            stage2_max_new_tokens = self.stage2_max_new_tokens
+            stage2_temperature = self.stage2_temperature
+            stage2_do_sample = self.stage2_do_sample
 
             # Create mock request for understanding model
             class MockRequest:
@@ -223,7 +252,7 @@ class QwenImageEditVisualCoT(lmms):
                     self.doc = None
                     self.args = (
                         question,  # contexts
-                        {"max_new_tokens": self.stage2_max_new_tokens, "temperature": self.stage2_temperature, "do_sample": self.stage2_do_sample},  # gen_kwargs
+                        {"max_new_tokens": stage2_max_new_tokens, "temperature": stage2_temperature, "do_sample": stage2_do_sample},  # gen_kwargs
                         lambda doc: [original_image, auxiliary_image] if original_image else [auxiliary_image],  # doc_to_visual
                         doc_id,
                         task,
@@ -290,6 +319,356 @@ class QwenImageEditVisualCoT(lmms):
 
         eval_logger.debug(f"Saved intermediate artifacts to: {metadata_path}")
 
+    def _generate_single_image_interleaved(
+        self,
+        prompt: str,
+        input_image: Image.Image,
+        doc_id: str,
+        task: str,
+        image_suffix: str,
+    ) -> Tuple[str, str]:
+        """
+        Generate a single image for interleaved generation
+
+        Args:
+            prompt: Text prompt for image generation
+            input_image: Input image to edit
+            doc_id: Document ID for file naming
+            task: Task name for file naming
+            image_suffix: Suffix for image filename (e.g., "cand0", "step_0001")
+
+        Returns:
+            Tuple of (response_text, generated_image_path)
+        """
+        try:
+            # Create a mock request for the editing model
+            class MockRequest:
+                def __init__(self, doc, args):
+                    self.doc = doc
+                    self.arguments = args
+
+            mock_doc = {
+                "image": input_image,
+                "prompt": prompt,
+                "task": task,
+                "doc_id": doc_id,
+                "num_inference_steps": self.stage1_num_inference_steps,
+                "guidance_scale": self.stage1_guidance_scale,
+            }
+
+            mock_request = MockRequest(mock_doc, None)
+            results = self.edit_model._generate_editing([mock_request])
+
+            if results and results[0]:
+                response = results[0]
+                # Extract image path from response
+                if isinstance(response, dict) and "image_path" in response:
+                    image_path = response["image_path"]
+                elif isinstance(response, str) and os.path.exists(response):
+                    image_path = response
+                else:
+                    # Image should be saved by edit_model
+                    image_path = os.path.join(
+                        self.intermediate_dir, "stage1_images", f"{task}_{doc_id}_{image_suffix}.png"
+                    )
+
+                eval_logger.info(f"Generated image: {image_path}")
+                return str(response), image_path
+            else:
+                eval_logger.warning(f"No image generated for {image_suffix}")
+                return "", ""
+
+        except Exception as e:
+            eval_logger.error(f"Failed to generate image for {image_suffix}: {e}")
+            if self.fail_gracefully:
+                return "", ""
+            else:
+                raise
+
+    def _generate_text_interleaved(
+        self,
+        prompt: str,
+        images: List[Image.Image],
+        doc_id: str,
+        max_new_tokens: int = 512,
+    ) -> str:
+        """
+        Generate text for interleaved generation
+
+        Args:
+            prompt: Text prompt
+            images: List of images to include in context
+            doc_id: Document ID
+            max_new_tokens: Maximum tokens to generate
+
+        Returns:
+            Generated text
+        """
+        try:
+            # Capture stage2 parameters from outer scope
+            stage2_temperature = self.stage2_temperature
+            stage2_do_sample = self.stage2_do_sample
+
+            # Create mock request for understanding model
+            class MockRequest:
+                def __init__(self, doc_id, task, split, args):
+                    self.doc = None
+                    self.args = (
+                        prompt,  # contexts
+                        {"max_new_tokens": max_new_tokens, "temperature": stage2_temperature, "do_sample": stage2_do_sample},  # gen_kwargs
+                        lambda doc: images,  # doc_to_visual
+                        doc_id,
+                        task,
+                        split,
+                    )
+
+            # Set up task_dict for the understanding model
+            mock_doc = {}
+            if not hasattr(self.understand_model, 'task_dict'):
+                self.understand_model.task_dict = {}
+            if 'temp_task' not in self.understand_model.task_dict:
+                self.understand_model.task_dict['temp_task'] = {}
+            if 'test' not in self.understand_model.task_dict['temp_task']:
+                self.understand_model.task_dict['temp_task']['test'] = {}
+            self.understand_model.task_dict['temp_task']['test'][doc_id] = mock_doc
+
+            mock_request = MockRequest(doc_id, 'temp_task', 'test', None)
+            results = self.understand_model._generate_understanding([mock_request])
+
+            if results and results[0]:
+                text = results[0]
+                eval_logger.debug(f"Generated text: {text[:100]}...")
+                return text
+            else:
+                return ""
+
+        except Exception as e:
+            eval_logger.error(f"Failed to generate text: {e}")
+            if self.fail_gracefully:
+                return ""
+            else:
+                raise
+
+    def generate_uni_mmmu_interleaved(
+        self,
+        input_images: List[Image.Image],
+        prompt: str,
+        doc_id: str,
+        task: str,
+        interleaved_config: dict,
+        doc: dict = None,
+    ) -> Tuple[str, List[str]]:
+        """
+        Uni-MMMU interleaved generation aligned with Bagel implementation.
+
+        This implements the exact generation flow from Bagel's Uni-MMMU:
+        - Jigsaw: gen_image(cand0) → gen_image(cand1) → gen_text(answer)
+        - Maze/Sliding: [gen_text(plan) → gen_image(step)]×k → gen_text(answer)
+
+        Args:
+            input_images: List of input images
+            prompt: Base prompt text
+            doc_id: Document ID for file naming
+            task: Task name for file naming
+            interleaved_config: Configuration dict from yaml
+            doc: Document data for dynamic num_images extraction
+
+        Returns:
+            Tuple of (final_text_answer, list_of_generated_image_paths)
+        """
+        import json as json_module
+
+        task_type = interleaved_config.get("task_type", "jigsaw")
+        eval_logger.info(f"Starting Uni-MMMU interleaved generation: task_type={task_type}, doc_id={doc_id}")
+
+        # Get num_images dynamically from doc if available
+        num_images = interleaved_config.get("num_images", 2)
+        if doc is not None:
+            if task_type == "maze":
+                # Get step count from ground truth
+                steps_str = doc.get("steps", "[]")
+                steps = json_module.loads(steps_str) if isinstance(steps_str, str) else steps_str
+                if steps:
+                    num_images = len(steps)
+                    eval_logger.info(f"Maze: dynamically determined {num_images} steps from ground truth")
+            elif task_type == "sliding":
+                # Get step count from ground truth
+                steps_str = doc.get("steps_words", "[]")
+                steps = json_module.loads(steps_str) if isinstance(steps_str, str) else steps_str
+                if steps:
+                    num_images = len(steps)
+                    eval_logger.info(f"Sliding: dynamically determined {num_images} steps from ground truth")
+
+        generated_images = []
+
+        if task_type == "jigsaw":
+            # Jigsaw: Generate 2 completed images then final answer
+            eval_logger.info("=== Jigsaw Task: Generating Candidate 0 ===")
+
+            # Image 1: Candidate 0 completion
+            suffix1 = "Output ONLY a single image with Candidate 0 placed in the bottom-right cell. No text."
+            full_prompt1 = f"{prompt}\n{suffix1}"
+
+            _, img0_path = self._generate_single_image_interleaved(
+                prompt=full_prompt1,
+                input_image=input_images[0] if input_images else None,
+                doc_id=doc_id,
+                task=task,
+                image_suffix="cand0",
+            )
+
+            if img0_path and os.path.exists(img0_path):
+                generated_images.append(img0_path)
+                img0 = Image.open(img0_path).convert("RGB")
+                eval_logger.info(f"Generated Candidate 0: {img0_path}")
+            else:
+                eval_logger.error("Failed to generate Candidate 0 image")
+                return "", []
+
+            eval_logger.info("=== Jigsaw Task: Generating Candidate 1 ===")
+
+            # Image 2: Candidate 1 completion
+            suffix2 = "Output ONLY a single image with Candidate 1 placed in the bottom-right cell. No text."
+            full_prompt2 = f"{prompt}\n{suffix2}"
+
+            _, img1_path = self._generate_single_image_interleaved(
+                prompt=full_prompt2,
+                input_image=input_images[0] if input_images else None,
+                doc_id=doc_id,
+                task=task,
+                image_suffix="cand1",
+            )
+
+            if img1_path and os.path.exists(img1_path):
+                generated_images.append(img1_path)
+                img1 = Image.open(img1_path).convert("RGB")
+                eval_logger.info(f"Generated Candidate 1: {img1_path}")
+            else:
+                eval_logger.error("Failed to generate Candidate 1 image")
+                return "", generated_images
+
+            eval_logger.info("=== Jigsaw Task: Generating Final Answer ===")
+
+            # Build context for final answer: original images + generated images
+            final_images = []
+            for img in input_images:
+                if img is not None:
+                    final_images.append(img)
+
+            # Add generated images with text markers (aligned with Bagel)
+            final_prompt = f"{prompt}\nCOMPLETED WITH CANDIDATE 0:"
+            final_images.append(img0)
+            final_prompt += "\nCOMPLETED WITH CANDIDATE 1:"
+            final_images.append(img1)
+
+            # Final answer prompt (aligned with Bagel)
+            final_suffix = (
+                '\nNow output EXACTLY ONE <FINAL_ANSWER_JSON>{"choice": 0 or 1, "rationale": "≤30 words"}</FINAL_ANSWER_JSON>\n'
+                "Do not output any additional images."
+            )
+            final_prompt += final_suffix
+
+            final_text = self._generate_text_interleaved(
+                prompt=final_prompt,
+                images=final_images,
+                doc_id=doc_id,
+                max_new_tokens=self.stage2_max_new_tokens,
+            )
+
+            eval_logger.info(f"Jigsaw final answer: {final_text}")
+
+        else:
+            # Maze/Sliding: [gen_text(plan) → gen_image(step)]×k → gen_text(answer)
+            eval_logger.info(f"=== {task_type.capitalize()} Task: Generating {num_images} steps ===")
+
+            step_texts = []
+            step_images = []
+            current_image = input_images[0] if input_images else None
+
+            for i in range(1, num_images + 1):
+                eval_logger.info(f"--- Step {i}/{num_images} ---")
+
+                # Generate planning text
+                if task_type == "maze":
+                    plan_suffix = f'Now planning for step {i}, Please output a sentence in the form: "Next, move one step up/down/left/right."'
+                else:  # sliding
+                    plan_suffix = f'Now planning for step {i}, Please output a sentence describing which tile to move and in which direction.'
+
+                # Build context with previous steps
+                plan_prompt = prompt
+                for j, (prev_text, prev_img) in enumerate(zip(step_texts, step_images), 1):
+                    plan_prompt += f"\n{prev_text}"
+                    plan_prompt += f"\nImage for step {j}:"
+                    # Note: prev_img is already in the context
+                plan_prompt += f"\n{plan_suffix}"
+
+                # Generate planning text
+                plan_images = [current_image] if current_image else []
+                for step_img in step_images:
+                    plan_images.append(step_img)
+
+                plan_text = self._generate_text_interleaved(
+                    prompt=plan_prompt,
+                    images=plan_images,
+                    doc_id=doc_id,
+                    max_new_tokens=128,
+                )
+                eval_logger.info(f"Step {i} plan: {plan_text}")
+                step_texts.append(plan_text)
+
+                # Generate step image
+                img_suffix = f"Now, generate the image for step {i}."
+                img_prompt = f"{prompt}\n{plan_text}\n{img_suffix}"
+
+                _, img_path = self._generate_single_image_interleaved(
+                    prompt=img_prompt,
+                    input_image=current_image,
+                    doc_id=doc_id,
+                    task=task,
+                    image_suffix=f"step_{i:04d}",
+                )
+
+                if img_path and os.path.exists(img_path):
+                    generated_images.append(img_path)
+                    step_img = Image.open(img_path).convert("RGB")
+                    step_images.append(step_img)
+                    current_image = step_img  # Update current image for next step
+                    eval_logger.info(f"Generated step {i} image: {img_path}")
+                else:
+                    eval_logger.warning(f"Failed to generate step {i} image")
+
+            eval_logger.info(f"=== {task_type.capitalize()} Task: Generating Final Answer ===")
+
+            # Build context for final answer (aligned with Bagel)
+            final_images = []
+            for img in input_images:
+                if img is not None:
+                    final_images.append(img)
+
+            final_prompt = prompt
+            for i, (plan_text, step_img) in enumerate(zip(step_texts, step_images), 1):
+                final_prompt += f"\n{plan_text}"
+                final_prompt += f"\nImage for step {i}:"
+                final_images.append(step_img)
+
+            # Final answer prompt (aligned with Bagel)
+            final_suffix = (
+                "\nAfter the images, emit EXACTLY ONE LINE containing ONLY the final move list "
+                "as <ANSWER_JSON>[...]</ANSWER_JSON>. No other text."
+            )
+            final_prompt += final_suffix
+
+            final_text = self._generate_text_interleaved(
+                prompt=final_prompt,
+                images=final_images,
+                doc_id=doc_id,
+                max_new_tokens=self.stage2_max_new_tokens,
+            )
+
+            eval_logger.info(f"{task_type.capitalize()} final answer: {final_text}")
+
+        return final_text, generated_images
+
     def generate_until(self, requests: List[Instance]) -> List[str]:
         """
         Two-stage visual CoT inference
@@ -307,6 +686,47 @@ class QwenImageEditVisualCoT(lmms):
         for request in requests:
             contexts, gen_kwargs, doc_to_visual, doc_id, task, split = request.args
 
+            # Check for interleaved generation configuration
+            interleaved_config = gen_kwargs.get("qwen_interleaved") or gen_kwargs.get("bagel_interleaved")
+
+            if interleaved_config:
+                # Interleaved generation path (Uni-MMMU)
+                eval_logger.info(f"\n{'='*60}")
+                eval_logger.info(f"Processing doc {doc_id} from task {task} (Interleaved Mode)")
+                eval_logger.info(f"{'='*60}")
+
+                # Extract all input images
+                input_images = []
+                doc = None
+                if doc_to_visual is not None:
+                    try:
+                        doc = self.understand_model.task_dict[task][split][doc_id]
+                        input_images = doc_to_visual(doc)
+                        eval_logger.debug(f"Extracted {len(input_images)} input images for doc {doc_id}")
+                    except Exception as e:
+                        eval_logger.warning(f"Failed to extract input images: {e}")
+
+                if not input_images:
+                    eval_logger.warning(f"No input images for interleaved generation, doc {doc_id}")
+                    res.append("")
+                    pbar.update(1)
+                    continue
+
+                # Call interleaved generation
+                final_answer, generated_image_paths = self.generate_uni_mmmu_interleaved(
+                    input_images=input_images,
+                    prompt=contexts,
+                    doc_id=doc_id,
+                    task=task,
+                    interleaved_config=interleaved_config,
+                    doc=doc,
+                )
+
+                res.append(final_answer)
+                pbar.update(1)
+                continue
+
+            # Standard two-stage visual CoT path
             # Extract original image
             original_image = None
             if doc_to_visual is not None:

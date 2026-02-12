@@ -1,0 +1,5 @@
+# PhyX Visual CoT Task Group
+group: phyx_simple
+task:
+  - phyx_optics100
+  - phyx_mechanics100

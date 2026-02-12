@@ -1,36 +1,41 @@
 #!/bin/bash
-# UniWorld Visual CoT - General Evaluation Script
+# LLaDA Model - General Evaluation Script
 #
-# This script evaluates UniWorld with Visual Chain-of-Thought on any task
+# This script evaluates LLaDA-8B-Instruct on any task
 #
 # Usage:
-#   bash uniworld_cot.sh [GPU_IDS] [TASK] [OUTPUT_PATH] [MODEL_PATH] [MASTER_PORT] [HF_REPO] [LIMIT]
+#   bash llada.sh [GPU_IDS] [TASK] [OUTPUT_PATH] [MODEL_PATH] [MASTER_PORT]
 #
 # Examples:
-#   # Uni-MMMU Jigsaw Visual CoT
-#   bash /home/aiscuser/lmms-eval/g2u/uniworld_cot.sh "0,1" "uni_mmmu_jigsaw100_visual_cot" "./logs/jigsaw_cot"
+#   # ChartQA
+#   bash /home/aiscuser/lmms-eval/g2u/llada.sh "0" "chartqa100" "./logs/llada_chartqa"
 #
-#   # Uni-MMMU Maze Visual CoT
-#   bash /home/aiscuser/lmms-eval/g2u/uniworld_cot.sh "0,1" "uni_mmmu_maze100_visual_cot" "./logs/maze_cot"
+#   # MMLU
+#   bash /home/aiscuser/lmms-eval/g2u/llada.sh "0" "mmlu" "./logs/llada_mmlu"
 #
-#   # All Uni-MMMU CoT tasks
-#   bash /home/aiscuser/lmms-eval/g2u/uniworld_cot.sh "0,1" "uni_mmmu_cot" "./logs/uni_mmmu_cot"
+#   # Multiple tasks (comma-separated, no spaces)
+#   bash /home/aiscuser/lmms-eval/g2u/llada.sh "0" "chartqa100,mmbench" "./logs/llada_multi"
 #
-#   # With limit
-#   bash /home/aiscuser/lmms-eval/g2u/uniworld_cot.sh "1" "geometry3k_cot" "./logs/geometry3k_cot" "LanguageBind/UniWorld-V1" "29706" "" "100"
+#   # With custom port
+#   bash /home/aiscuser/lmms-eval/g2u/llada.sh "0" "chartqa100" "./logs/llada_chartqa" "GSAI-ML/LLaDA-8B-Instruct" "29700"
 
 # ============ Configuration ============
 GPU_IDS=${1:-"0"}
-TASK=${2:-"uni_mmmu_cot"}
-OUTPUT_PATH=${3:-"./logs/uniworld_cot_${TASK}"}
-MODEL_PATH=${4:-"LanguageBind/UniWorld-V1"}
+TASK=${2:-"mmlu"}
+OUTPUT_PATH=${3:-"./logs/llada_${TASK}"}
+MODEL_PATH=${4:-"GSAI-ML/LLaDA-8B-Instruct"}
 MASTER_PORT=${5:-"29700"}
-HF_REPO=${6:-""}  # Optional: HF repo for uploading logs (e.g., "username/uniworld-results")
+HF_REPO=${6:-""}  # Optional: HF repo for uploading logs
 LIMIT=${7:-""}  # Optional: limit number of samples
 BATCH_SIZE=1
 
-# Model args
-MODEL_ARGS="pretrained=${MODEL_PATH},min_pixels=112*112,max_pixels=224*224"
+# Model args - use LLaDA default values
+GEN_LENGTH=128
+MAX_GEN_LENGTH=128  # Limit max generation length to prevent slow tasks
+MC_NUM=128
+STEPS=128
+
+MODEL_ARGS="pretrained=${MODEL_PATH},gen_length=${GEN_LENGTH},max_gen_length=${MAX_GEN_LENGTH},steps=${STEPS},mc_num=${MC_NUM}"
 if [ -n "$HF_REPO" ]; then
     MODEL_ARGS="${MODEL_ARGS},hf_repo=${HF_REPO},hf_upload=True"
     echo "📤 Hugging Face upload enabled: ${HF_REPO}"
@@ -49,19 +54,18 @@ export GLOO_USE_IPV6=0
 
 # ============ Print Configuration ============
 echo "======================================"
-echo "UniWorld Visual CoT - Evaluation"
+echo "LLaDA - General Evaluation"
 echo "======================================"
 echo "GPU(s):        ${GPU_IDS}"
 echo "Model Path:    ${MODEL_PATH}"
 echo "Task(s):       ${TASK}"
 echo "Output Path:   ${OUTPUT_PATH}"
 echo "Batch Size:    ${BATCH_SIZE}"
+echo "Gen Length:    ${GEN_LENGTH}"
+echo "MC Samples:    ${MC_NUM}"
 echo "Master Port:   ${MASTER_PORT}"
 if [ -n "$HF_REPO" ]; then
     echo "HF Upload:     ${HF_REPO}"
-fi
-if [ -n "$LIMIT" ]; then
-    echo "Sample Limit:  ${LIMIT}"
 fi
 echo "======================================"
 echo ""
@@ -78,7 +82,7 @@ accelerate launch \
   --num_machines=1 \
   --mixed_precision=bf16 \
   -m lmms_eval \
-  --model uniworld_visual_cot \
+  --model llada \
   --model_args ${MODEL_ARGS} \
   --tasks ${TASK} \
   --batch_size ${BATCH_SIZE} \

@@ -79,8 +79,17 @@ class UniWorldVisualCoT(lmms):
         self.stage2_do_sample = stage2_do_sample
 
         # UniWorld parameters
-        self.min_pixels = min_pixels
-        self.max_pixels = max_pixels
+        # Handle string format like "112*112" from command line
+        if isinstance(min_pixels, str):
+            self.min_pixels = eval(min_pixels) if '*' in min_pixels else int(min_pixels)
+        else:
+            self.min_pixels = min_pixels
+
+        if isinstance(max_pixels, str):
+            self.max_pixels = eval(max_pixels) if '*' in max_pixels else int(max_pixels)
+        else:
+            self.max_pixels = max_pixels
+
         self.no_joint_with_t5 = no_joint_with_t5
         self.offload = offload
 
@@ -173,6 +182,30 @@ class UniWorldVisualCoT(lmms):
             contexts, gen_kwargs, doc_to_visual, doc_id, task, split = request.args
 
             try:
+                # Check for Uni-MMMU interleaved mode
+                # Support both uniworld_interleaved and bagel_interleaved for compatibility
+                uniworld_interleaved = gen_kwargs.get("uniworld_interleaved", None) or gen_kwargs.get("bagel_interleaved", None)
+
+                if uniworld_interleaved is not None:
+                    # Uni-MMMU interleaved generation mode
+                    if not hasattr(self, 'task_dict'):
+                        raise ValueError(f"task_dict not set for model")
+
+                    doc = self.task_dict[task][split][doc_id]
+                    input_images = []
+                    if doc_to_visual:
+                        visuals = [doc_to_visual(doc)]
+                        input_images = self.flatten(visuals)
+
+                    output_text, output_images = self.generate_uni_mmmu_interleaved(
+                        input_images, contexts, str(doc_id), task, uniworld_interleaved, doc
+                    )
+                    output = json.dumps({"text": output_text, "images": output_images}, ensure_ascii=False)
+                    res.append(output)
+                    pbar.update(1)
+                    continue
+
+                # Standard two-stage Visual CoT mode
                 # Extract original image (required for Visual CoT)
                 if doc_to_visual is None:
                     raise ValueError(f"doc_to_visual is None for doc {doc_id}")
@@ -233,6 +266,318 @@ class UniWorldVisualCoT(lmms):
 
         pbar.close()
         return res
+
+    def generate_uni_mmmu_interleaved(
+        self,
+        input_images: List,
+        prompt: str,
+        doc_id: str,
+        task: str,
+        interleaved_config: dict,
+        doc: dict = None,
+    ) -> Tuple[str, List[str]]:
+        """
+        Uni-MMMU interleaved generation aligned with Bagel's implementation.
+
+        This implements the exact generation flow from the original Uni-MMMU:
+        - Jigsaw: gen_image(cand0) → gen_image(cand1) → gen_text(answer)
+        - Maze/Sliding: [gen_text(plan) → gen_image(step)]×k → gen_text(answer)
+
+        Args:
+            input_images: List of input images
+            prompt: Base prompt text
+            doc_id: Document ID for file naming
+            task: Task name for file naming
+            interleaved_config: Configuration dict from yaml
+            doc: Document data for dynamic num_images extraction
+
+        Returns:
+            Tuple of (final_text_answer, list_of_generated_image_paths)
+        """
+        task_type = interleaved_config.get("task_type", "jigsaw")
+        num_images = interleaved_config.get("num_images", 2)
+
+        # Get num_images dynamically from doc if available
+        if doc is not None:
+            if task_type == "maze":
+                steps_str = doc.get("steps", "[]")
+                steps = json.loads(steps_str) if isinstance(steps_str, str) else steps_str
+                if steps:
+                    num_images = len(steps)
+            elif task_type == "sliding":
+                steps_str = doc.get("steps_words", "[]")
+                steps = json.loads(steps_str) if isinstance(steps_str, str) else steps_str
+                if steps:
+                    num_images = len(steps)
+
+        generated_images = []
+
+        if task_type == "jigsaw":
+            eval_logger.info(f"[Doc {doc_id}] Jigsaw mode: generating 2 candidate completions")
+
+            # Generate Candidate 0 completion
+            suffix1 = "Output ONLY a single image with Candidate 0 placed in the bottom-right cell. No text."
+            full_prompt1 = f"{prompt}\n{suffix1}"
+
+            eval_logger.info(f"[Doc {doc_id}] Generating Candidate 0 completion...")
+            img0_path = self._generate_single_image(
+                prompt=full_prompt1,
+                input_images=input_images,
+                doc_id=f"{doc_id}_cand0",
+                task=task
+            )
+            if img0_path:
+                generated_images.append(img0_path)
+                eval_logger.info(f"[Doc {doc_id}] ✅ Candidate 0: {img0_path}")
+
+            # Generate Candidate 1 completion
+            suffix2 = "Output ONLY a single image with Candidate 1 placed in the bottom-right cell. No text."
+            full_prompt2 = f"{prompt}\n{suffix2}"
+
+            eval_logger.info(f"[Doc {doc_id}] Generating Candidate 1 completion...")
+            img1_path = self._generate_single_image(
+                prompt=full_prompt2,
+                input_images=input_images,
+                doc_id=f"{doc_id}_cand1",
+                task=task
+            )
+            if img1_path:
+                generated_images.append(img1_path)
+                eval_logger.info(f"[Doc {doc_id}] ✅ Candidate 1: {img1_path}")
+
+            # Generate final answer using all images
+            # Align with Bagel: original images → prompt → cand0 image → text → cand1 image → text → final_suffix
+            final_suffix = (
+                'Now output EXACTLY ONE <FINAL_ANSWER_JSON>{"choice": 0 or 1, "rationale": "≤30 words"}</FINAL_ANSWER_JSON>\n'
+                "Do not output any additional images."
+            )
+            final_question = f"{prompt}\n\nCOMPLETED WITH CANDIDATE 0:\n\nCOMPLETED WITH CANDIDATE 1:\n\n{final_suffix}"
+
+            # Prepare all images for final answer
+            all_images = input_images + generated_images
+            eval_logger.info(f"[Doc {doc_id}] Generating final answer with {len(all_images)} images...")
+            final_text = self._generate_text_answer(
+                question=final_question,
+                images=all_images,
+                doc_id=doc_id
+            )
+
+            return final_text, generated_images
+
+        else:
+            # Maze/Sliding: [gen_text(plan) → gen_image(step)]×k → gen_text(answer)
+            eval_logger.info(f"[Doc {doc_id}] {task_type.capitalize()} mode: generating {num_images} steps")
+
+            step_texts = []
+            accumulated_images = list(input_images)  # Start with input images
+
+            for i in range(1, num_images + 1):
+                # Generate planning text
+                if task_type == "maze":
+                    plan_suffix = f'Now planning for step {i}, Please output a sentence in the form: "Next, move one step up/down/left/right."'
+                else:  # sliding
+                    plan_suffix = f'Now planning for step {i}, Please output a sentence describing which tile to move and in which direction.'
+
+                # Build context with all previous steps
+                context_text = prompt
+                for j, prev_text in enumerate(step_texts, 1):
+                    context_text += f"\n\nStep {j} plan: {prev_text}"
+                context_text += f"\n\n{plan_suffix}"
+
+                eval_logger.info(f"[Doc {doc_id}] Generating step {i} plan...")
+                plan_text = self._generate_text_answer(
+                    question=context_text,
+                    images=accumulated_images,
+                    doc_id=f"{doc_id}_plan_{i}",
+                    max_tokens=128
+                )
+                step_texts.append(plan_text)
+                eval_logger.info(f"[Doc {doc_id}] Step {i} plan: {plan_text}")
+
+                # Generate step image
+                img_suffix = f"Now, generate the image for step {i}."
+                img_prompt = f"{context_text}\n\n{plan_text}\n\n{img_suffix}"
+
+                eval_logger.info(f"[Doc {doc_id}] Generating step {i} image...")
+                img_path = self._generate_single_image(
+                    prompt=img_prompt,
+                    input_images=accumulated_images,
+                    doc_id=f"{doc_id}_step_{i:04d}",
+                    task=task
+                )
+
+                if img_path:
+                    generated_images.append(img_path)
+                    accumulated_images.append(img_path)
+                    eval_logger.info(f"[Doc {doc_id}] ✅ Step {i} image: {img_path}")
+
+            # Generate final answer with all steps
+            # Align with Bagel: original images → prompt → [plan_text → "Image for step i:" → step_image]×k → final_suffix
+            final_suffix = (
+                "After the images, emit EXACTLY ONE LINE containing ONLY the final move list "
+                "as <ANSWER_JSON>[...]</ANSWER_JSON>. No other text."
+            )
+
+            # Build final context with all steps (aligned with Bagel)
+            final_context = prompt
+            for i, plan_text in enumerate(step_texts, 1):
+                final_context += f"\n\n{plan_text}"
+                final_context += f"\nImage for step {i}:"
+            final_context += f"\n\n{final_suffix}"
+
+            eval_logger.info(f"[Doc {doc_id}] Generating final answer with {len(accumulated_images)} images...")
+            final_text = self._generate_text_answer(
+                question=final_context,
+                images=accumulated_images,
+                doc_id=doc_id
+            )
+
+            return final_text, generated_images
+
+    def _generate_single_image(
+        self,
+        prompt: str,
+        input_images: List,
+        doc_id: str,
+        task: str
+    ) -> Optional[str]:
+        """
+        Generate a single image using UniWorld's generation mode.
+
+        Args:
+            prompt: Text prompt for image generation
+            input_images: List of input images (PIL Images or paths)
+            doc_id: Document ID for file naming
+            task: Task name for file naming
+
+        Returns:
+            Path to generated image, or None if generation failed
+        """
+        from qwen_vl_utils import process_vision_info
+
+        try:
+            # Prepare messages for image generation
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        *[{"type": "image", "image": img} for img in input_images if img is not None],
+                        {"type": "text", "text": prompt}
+                    ]
+                }
+            ]
+
+            # Process inputs
+            text = self.uniworld.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            image_inputs, video_inputs = process_vision_info(messages)
+
+            inputs = self.uniworld.processor(
+                text=[text],
+                images=image_inputs,
+                videos=video_inputs,
+                padding=True,
+                return_tensors="pt",
+            ).to(self.uniworld._device)
+
+            # Call UniWorld's image generation method
+            image_output = self.uniworld._generate_image(
+                inputs=inputs,
+                prompt_text=prompt,
+                history_image_paths=[],
+                doc_id=doc_id,
+                task=task,
+            )
+
+            # Parse output to get image path
+            if isinstance(image_output, str) and image_output.startswith("{"):
+                output_dict = json.loads(image_output)
+                images = output_dict.get("images", [])
+                if images:
+                    return images[0]
+
+            return None
+
+        except Exception as e:
+            eval_logger.error(f"Error generating image for doc_id={doc_id}: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def _generate_text_answer(
+        self,
+        question: str,
+        images: List,
+        doc_id: str,
+        max_tokens: Optional[int] = None
+    ) -> str:
+        """
+        Generate text answer using UniWorld's understanding mode.
+
+        Args:
+            question: Question text
+            images: List of images (PIL Images or paths)
+            doc_id: Document ID for logging
+            max_tokens: Maximum tokens to generate (default: use stage2_max_new_tokens)
+
+        Returns:
+            Generated text answer
+        """
+        from qwen_vl_utils import process_vision_info
+
+        try:
+            # Prepare conversation with multiple images
+            content = [{"type": "text", "text": question}]
+            for img in images:
+                if img is not None:
+                    content.append({
+                        "type": "image",
+                        "image": img,
+                        "min_pixels": self.min_pixels,
+                        "max_pixels": self.max_pixels
+                    })
+
+            messages = [{"role": "user", "content": content}]
+
+            # Process inputs
+            text = self.uniworld.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            image_inputs, video_inputs = process_vision_info(messages)
+
+            inputs = self.uniworld.processor(
+                text=[text],
+                images=image_inputs,
+                videos=video_inputs,
+                padding=True,
+                return_tensors="pt",
+            ).to(self.uniworld._device)
+
+            # Generate text
+            with torch.no_grad():
+                outputs = self.uniworld.model.generate(
+                    **inputs,
+                    max_new_tokens=max_tokens if max_tokens else self.stage2_max_new_tokens,
+                    do_sample=self.stage2_do_sample,
+                    temperature=self.stage2_temperature if self.stage2_do_sample else None,
+                    pad_token_id=self.uniworld.processor.tokenizer.pad_token_id,
+                    eos_token_id=self.uniworld.processor.tokenizer.eos_token_id,
+                )
+
+            # Decode output
+            generated_ids = outputs[0][inputs['input_ids'].shape[1]:]
+            answer = self.uniworld.processor.tokenizer.decode(
+                generated_ids, skip_special_tokens=True
+            ).strip()
+
+            return answer
+
+        except Exception as e:
+            eval_logger.error(f"Error generating text answer for doc_id={doc_id}: {e}")
+            import traceback
+            traceback.print_exc()
+            return ""
 
     def _stage1_generate(
         self,
