@@ -25,7 +25,7 @@ class XOmni(lmms):
         output_image_dir: Optional[str] = None,
         max_new_tokens: int = 256,  # Reduced from 512 to prevent excessive generation
         do_sample: bool = False,
-        temperature: float = 0.7,
+        temperature: float = 0.0,
         top_p: float = 0.9,
         seed: int = 0,
         num_inference_steps: int = 28,
@@ -408,6 +408,137 @@ class XOmni(lmms):
     def format_output(self, text: str, images: List[str]) -> str:
         output_dict = {"text": text, "images": images}
         return json.dumps(output_dict, ensure_ascii=False)
+    
+    def fix_json_format(self, text: str) -> str:
+        """
+        Fix common JSON format issues in model output:
+        1. Ensure choice is an integer, not a string (for jigsaw)
+        2. Fix 'rationle' typo to 'rationale' (for jigsaw)
+        3. Add <FINAL_ANSWER_JSON> tags if missing (for jigsaw)
+        4. Fix <ANSWER_JSON> tags and array format (for maze/sliding)
+        5. Fix closing tags: </ANSWERS_JSON>, </ANSWERSJSON>, </ANSWERS> -> </ANSWER_JSON>
+        6. Extract and format move sequences properly
+        """
+        import re
+        
+        # Fix closing tag variations first
+        text = re.sub(r'</ANSWERS?_?JSON>', '</ANSWER_JSON>', text)
+        text = re.sub(r'</ANSWERSJSON>', '</ANSWER_JSON>', text)
+        text = re.sub(r'</ANSWERS>', '</ANSWER_JSON>', text)
+        text = re.sub(r'</answering>', '</ANSWER_JSON>', text, flags=re.IGNORECASE)
+        
+        # Try to find JSON object (for jigsaw tasks)
+        json_obj_pattern = r'\{[^}]*"choice"[^}]*\}'
+        obj_match = re.search(json_obj_pattern, text)
+        
+        if obj_match:
+            json_str = obj_match.group(0)
+            try:
+                # Parse the JSON
+                json_obj = json.loads(json_str)
+                
+                # Fix choice type: convert string to int
+                if 'choice' in json_obj and isinstance(json_obj['choice'], str):
+                    json_obj['choice'] = int(json_obj['choice'])
+                
+                # Fix typo: rationle -> rationale
+                if 'rationle' in json_obj:
+                    json_obj['rationale'] = json_obj.pop('rationle')
+                if 'rationate' in json_obj:
+                    json_obj['rationale'] = json_obj.pop('rationate')
+                
+                # Reconstruct the JSON string
+                fixed_json = json.dumps(json_obj, ensure_ascii=False)
+                
+                # Check if tags are present
+                if '<FINAL_ANSWER_JSON>' not in text and '<ANSWER_JSON>' not in text:
+                    # Replace the original JSON with tagged version
+                    text = text.replace(json_str, f'<FINAL_ANSWER_JSON>{fixed_json}</FINAL_ANSWER_JSON>')
+                else:
+                    # Just replace the JSON content
+                    text = text.replace(json_str, fixed_json)
+                    
+            except (json.JSONDecodeError, ValueError) as e:
+                eval_logger.warning(f"Failed to parse JSON object for fixing: {e}")
+        
+        # Try to find and fix JSON array (for maze/sliding tasks)
+        # First, try to extract from existing tags
+        answer_json_pattern = r'<ANSWER_JSON>\s*(\[.*?\])\s*</ANSWER_JSON>'
+        answer_match = re.search(answer_json_pattern, text, re.DOTALL)
+        
+        if answer_match:
+            array_str = answer_match.group(1)
+            try:
+                array_obj = json.loads(array_str)
+                if isinstance(array_obj, list):
+                    # Normalize moves
+                    valid_moves = {'up', 'down', 'left', 'right'}
+                    normalized = []
+                    for move in array_obj:
+                        if isinstance(move, str):
+                            move_lower = move.lower().strip()
+                            if move_lower in valid_moves:
+                                normalized.append(move_lower)
+                    
+                    if normalized:
+                        fixed_array = json.dumps(normalized, ensure_ascii=False)
+                        text = re.sub(answer_json_pattern, f'<ANSWER_JSON>{fixed_array}</ANSWER_JSON>', text, flags=re.DOTALL)
+                        return text
+            except (json.JSONDecodeError, ValueError):
+                pass
+        
+        # If no valid tagged array found, try to find any JSON array in the text
+        json_array_pattern = r'\[[^\]]*\]'
+        array_matches = re.findall(json_array_pattern, text)
+        
+        best_array = None
+        best_score = 0
+        
+        for array_str in array_matches:
+            try:
+                # Parse the array
+                array_obj = json.loads(array_str)
+                if isinstance(array_obj, list) and len(array_obj) > 0:
+                    # Check if it looks like a move list (contains strings)
+                    if all(isinstance(item, str) for item in array_obj):
+                        # Normalize moves: convert to lowercase and filter valid moves
+                        valid_moves = {'up', 'down', 'left', 'right'}
+                        normalized = []
+                        for move in array_obj:
+                            move_lower = move.lower().strip()
+                            # Map common variations
+                            if move_lower in valid_moves:
+                                normalized.append(move_lower)
+                            elif 'up' in move_lower and 'down' not in move_lower:
+                                normalized.append('up')
+                            elif 'down' in move_lower:
+                                normalized.append('down')
+                            elif 'left' in move_lower:
+                                normalized.append('left')
+                            elif 'right' in move_lower:
+                                normalized.append('right')
+                        
+                        # Score this array based on number of valid moves
+                        score = len(normalized)
+                        if score > best_score:
+                            best_score = score
+                            best_array = normalized
+                        
+            except (json.JSONDecodeError, ValueError):
+                continue
+        
+        # If we found a valid array, format it properly
+        if best_array:
+            fixed_array = json.dumps(best_array, ensure_ascii=False)
+            # Check if tags already exist
+            if '<ANSWER_JSON>' in text:
+                # Replace the content between tags
+                text = re.sub(r'<ANSWER_JSON>.*?</ANSWER_JSON>', f'<ANSWER_JSON>{fixed_array}</ANSWER_JSON>', text, flags=re.DOTALL)
+            else:
+                # Add tags at the end
+                text = text.rstrip() + f'\n\n<ANSWER_JSON>{fixed_array}</ANSWER_JSON>'
+        
+        return text
 
     def flatten(self, input_list):
         output = []
@@ -462,6 +593,9 @@ class XOmni(lmms):
                 
                 # Use multi-image understanding
                 result = self.understand_images(prompt, images, str(doc_id))
+                # Fix format issues based on task type
+
+                result = self.fix_json_format(result)
                 res.append(result)
             else:
                 out_txt, out_imgs = self.generate_image(prompt, str(doc_id), task)
