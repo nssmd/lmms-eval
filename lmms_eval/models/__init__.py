@@ -49,6 +49,7 @@ AVAILABLE_SIMPLE_MODELS = {
     "mantis": "Mantis",
     "minicpm_v": "MiniCPM_V",
     "minimonkey": "MiniMonkey",
+    "mio": "MIO",
     "mmada": "MMaDA",
     "moviechat": "MovieChat",
     "mplug_owl_video": "mplug_Owl",

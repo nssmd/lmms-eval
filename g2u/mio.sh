@@ -68,7 +68,22 @@ MODEL_ARGS="${MODEL_ARGS},top_p=0.7"
 MODEL_ARGS="${MODEL_ARGS},repetition_penalty=1.0"
 
 # ============ Environment Setup ============
-export LD_LIBRARY_PATH=/home/aiscuser/cuda_compat:/usr/local/cuda-12.6/lib64:$LD_LIBRARY_PATH
+# Force conda's libstdc++ to be used via LD_PRELOAD (higher priority than LD_LIBRARY_PATH)
+# Handle both conda environments and virtual environments based on conda
+PYTHON_PATH=$(which python)
+if [ -f "$(dirname $(dirname ${PYTHON_PATH}))/pyvenv.cfg" ]; then
+    # We're in a virtual environment, get the base conda environment
+    # pyvenv.cfg has "home = /opt/conda/envs/ptca/bin", we need /opt/conda/envs/ptca/lib
+    CONDA_LIB=$(grep "^home = " "$(dirname $(dirname ${PYTHON_PATH}))/pyvenv.cfg" | cut -d' ' -f3 | xargs dirname)/lib
+else
+    # We're in a conda environment directly
+    CONDA_LIB=$(dirname $(dirname ${PYTHON_PATH}))/lib
+fi
+export LD_LIBRARY_PATH=${CONDA_LIB}:/home/aiscuser/cuda_compat:/usr/local/cuda-12.6/lib64:$LD_LIBRARY_PATH
+export LD_PRELOAD=${CONDA_LIB}/libstdc++.so.6:${LD_PRELOAD}
+echo "Debug: CONDA_LIB=${CONDA_LIB}"
+echo "Debug: LD_LIBRARY_PATH=${LD_LIBRARY_PATH}"
+echo "Debug: LD_PRELOAD=${LD_PRELOAD}"
 export CUDA_VISIBLE_DEVICES=${GPU_IDS}
 export MASTER_PORT=${MASTER_PORT_ARG}
 export WORLD_SIZE=1
