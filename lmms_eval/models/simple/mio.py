@@ -80,21 +80,30 @@ class MIO(lmms):
         try:
             from tokenization_mio import MIOTokenizer
             from transformers import AutoModelForCausalLM
+            from huggingface_hub import snapshot_download
         except ImportError as e:
             raise ImportError(
                 f"Failed to import MIO dependencies: {e}\n"
                 "Please install requirements: pip install -r MIO/requirements.txt"
             )
-        
+
+        # Download model to local cache if it's a HuggingFace repo ID
+        if not os.path.exists(pretrained):
+            eval_logger.info(f"Downloading model from HuggingFace Hub: {pretrained}")
+            local_model_path = snapshot_download(repo_id=pretrained)
+            eval_logger.info(f"Model downloaded to: {local_model_path}")
+        else:
+            local_model_path = pretrained
+
         # Load model
         self.model = AutoModelForCausalLM.from_pretrained(
-            pretrained,
+            local_model_path,
             torch_dtype=self._dtype,
             device_map="auto",
         ).eval()
-        
+
         # Load tokenizer
-        self.tokenizer = MIOTokenizer(pretrained, str(self._device))
+        self.tokenizer = MIOTokenizer(local_model_path, str(self._device))
         
         eval_logger.info("✅ MIO model loaded successfully")
     

@@ -68,6 +68,8 @@ MODEL_ARGS="${MODEL_ARGS},top_p=0.7"
 MODEL_ARGS="${MODEL_ARGS},repetition_penalty=1.0"
 
 # ============ Environment Setup ============
+# Force conda's libstdc++ to be loaded first to avoid CXXABI version mismatch
+export LD_PRELOAD=/opt/conda/envs/ptca/lib/libstdc++.so.6:${LD_PRELOAD}
 export LD_LIBRARY_PATH=/home/aiscuser/cuda_compat:/usr/local/cuda-12.6/lib64:$LD_LIBRARY_PATH
 export CUDA_VISIBLE_DEVICES=${GPU_IDS}
 export MASTER_PORT=${MASTER_PORT_ARG}
