@@ -9,3 +9,7 @@ bash /home/aiscuser/lmms-eval/g2u/mio.sh "5" "realunify" "./logs/realunify" "m-a
 bash /home/aiscuser/lmms-eval/g2u/mio.sh "4" "mmsi" "./logs/mmsi" "m-a-p/MIO-7B-Instruct" "29606"
 bash /home/aiscuser/lmms-eval/g2u/mio.sh "7" "uni_mmmu" "./logs/uni_mmmu" "m-a-p/MIO-7B-Instruct" "29607"
 bash /home/aiscuser/lmms-eval/g2u/mio.sh "7" "vsp" "./logs/vsp" "m-a-p/MIO-7B-Instruct" "29608"
+bash /home/aiscuser/lmms-eval/g2u/mio.sh "7" "babyvision" "./logs/babyvision" "m-a-p/MIO-7B-Instruct" "29609"
+bash /home/aiscuser/lmms-eval/g2u/mio.sh "6" "phyx" "./logs/phyx" "m-a-p/MIO-7B-Instruct" "29610"
+bash /home/aiscuser/lmms-eval/g2u/mio.sh "4" "auxsolidmath_easy" "./logs/auxsolidmath_easy" "m-a-p/MIO-7B-Instruct" "29611"
+bash /home/aiscuser/lmms-eval/g2u/mio.sh "4" "geometry3k" "./logs/geometry3k" "m-a-p/MIO-7B-Instruct" "29612 " "" "100"

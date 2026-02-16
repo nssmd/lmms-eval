@@ -5,7 +5,7 @@
 # Supports both understanding and generation tasks
 #
 # Usage:
-#   bash mio.sh [GPU_IDS] [TASK] [OUTPUT_PATH] [MODEL_PATH] [MASTER_PORT] [HF_REPO]
+#   bash mio.sh [GPU_IDS] [TASK] [OUTPUT_PATH] [MODEL_PATH] [MASTER_PORT] [HF_REPO] [LIMIT]
 #
 # Examples:
 #   # ChartQA (10 samples)
@@ -19,6 +19,9 @@
 #   bash uniworld_general.sh "2" "chartqa100" "./logs/chartqa" "./models/UniWorld-V1" --verbosity DEBUG
 #   # COCO Captioning
 #   bash mio.sh "0" "coco_cap_val" "./logs/coco"
+#
+#   # With limit for testing
+#   bash mio.sh "0" "chartqa100" "./logs/chartqa" "m-a-p/MIO-7B-Instruct" "29602" "" "10"
 
 
 #   bash /home/aiscuser/lmms-eval/g2u/mio.sh "4" "chartqa100" "./logs/test"
@@ -40,7 +43,14 @@ OUTPUT_PATH=${3:-"./logs/mio_${TASK}"}
 MODEL_PATH=${4:-"m-a-p/MIO-7B-Instruct"}
 MASTER_PORT_ARG=${5:-"29603"}
 HF_REPO=${6:-""}  # Optional: HuggingFace repo to upload logs (e.g., "username/repo-name")
+LIMIT=${7:-""}  # Optional: limit number of samples for testing
 BATCH_SIZE=1
+
+# Build limit argument if provided
+LIMIT_ARG=""
+if [ -n "${LIMIT}" ]; then
+  LIMIT_ARG="--limit ${LIMIT}"
+fi
 
 # ============ Check MIO Repository ============
 if [ ! -d "../MIO" ] && [ ! -d "MIO" ]; then
@@ -92,6 +102,9 @@ echo "Master Port:   ${MASTER_PORT}"
 if [ -n "${HF_REPO}" ]; then
     echo "HF Upload:     ${HF_REPO}"
 fi
+if [ -n "${LIMIT}" ]; then
+    echo "Limit:         ${LIMIT}"
+fi
 echo "======================================"
 echo ""
 
@@ -104,7 +117,8 @@ python -m lmms_eval \
   --output_path ${OUTPUT_PATH} \
   --log_samples \
   --log_samples_suffix mio_${TASK} \
-  --verbosity INFO
+  --verbosity INFO \
+  ${LIMIT_ARG}
 
 echo ""
 echo "======================================"

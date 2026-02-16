@@ -136,22 +136,31 @@ class MIOVisualCoT(lmms):
         try:
             from tokenization_mio import MIOTokenizer
             from transformers import AutoModelForCausalLM
+            from huggingface_hub import snapshot_download
         except ImportError as e:
             raise ImportError(
                 f"Failed to import MIO dependencies: {e}\n"
                 "Please install requirements: pip install -r MIO/requirements.txt"
             )
-        
+
+        # Download model to local cache if it's a HuggingFace repo ID
+        if not os.path.exists(self.pretrained):
+            eval_logger.info(f"Downloading model from HuggingFace Hub: {self.pretrained}")
+            local_model_path = snapshot_download(repo_id=self.pretrained)
+            eval_logger.info(f"Model downloaded to: {local_model_path}")
+        else:
+            local_model_path = self.pretrained
+
         # Load model
         self.model = AutoModelForCausalLM.from_pretrained(
-            self.pretrained,
+            local_model_path,
             torch_dtype=self._dtype,
             device_map="auto",
         ).eval()
-        
+
         # Load tokenizer
-        self.tokenizer = MIOTokenizer(self.pretrained, str(self._device))
-        
+        self.tokenizer = MIOTokenizer(local_model_path, str(self._device))
+
         eval_logger.info("✅ MIO model loaded successfully")
 
     @property
@@ -313,12 +322,22 @@ class MIOVisualCoT(lmms):
                 save_speeches=False
             )
 
-            # Get paths of generated images
+            # Find and rename generated image files to avoid overwriting
+            # detokenize saves files as detokenized_image_0_0.jpg, detokenized_image_0_1.jpg, etc.
+            import glob
             generated_image_paths = []
-            if generated_images and len(generated_images) > 0:
-                for img_list in generated_images:
-                    if img_list:  # Check if list is not empty
-                        generated_image_paths.extend(img_list)
+            detokenized_files = sorted(glob.glob(os.path.join(stage1_output_dir, "detokenized_image_*.jpg")))
+
+            for i, old_path in enumerate(detokenized_files):
+                # Create new filename with doc_id
+                ext = os.path.splitext(old_path)[1]
+                new_filename = f"doc_{doc_id}_image_{i}{ext}"
+                new_path = os.path.join(stage1_output_dir, new_filename)
+
+                # Rename the file
+                os.rename(old_path, new_path)
+                generated_image_paths.append(new_path)
+                eval_logger.info(f"Stage 1 - Renamed {os.path.basename(old_path)} -> {new_filename}")
 
             eval_logger.info(f"Stage 1 - Generated {len(generated_image_paths)} image(s) for doc {doc_id}")
             
@@ -334,6 +353,266 @@ class MIOVisualCoT(lmms):
 
         except Exception as e:
             eval_logger.error(f"Stage 1 failed for doc {doc_id}: {e}")
+            import traceback
+            eval_logger.error(traceback.format_exc())
+            if self.fail_gracefully:
+                return "", []
+            else:
+                raise
+
+    def _generate_planning_text(
+        self,
+        prompt: str,
+        plan_prompt: str,
+        doc_id: str,
+        original_image: Optional[Image.Image],
+        previous_steps: List[str],
+        previous_images: List[str],
+    ) -> str:
+        """
+        Generate planning text for the next step
+
+        Args:
+            prompt: Original question text
+            plan_prompt: Planning prompt (e.g., "Now planning for step 1...")
+            doc_id: Document ID for logging
+            original_image: Original input image
+            previous_steps: List of previous planning texts
+            previous_images: List of previous generated image paths
+
+        Returns:
+            Planning text
+        """
+        try:
+            # Build context with original image and previous steps
+            context_parts = [prompt]
+
+            # Add previous steps and images to context
+            for i, (step_text, img_path) in enumerate(zip(previous_steps, previous_images), 1):
+                context_parts.append(f"Step {i}: {step_text}")
+                context_parts.append(f"Image for step {i}:")
+
+            # Add planning prompt
+            context_parts.append(plan_prompt)
+
+            full_context = "\n".join(context_parts)
+
+            # Prepare image paths
+            image_paths = []
+            temp_files = []
+
+            # Add original image
+            if original_image is not None:
+                import tempfile
+                tmp = tempfile.NamedTemporaryFile(suffix='.jpg', delete=False)
+                original_image.save(tmp.name, 'JPEG')
+                tmp.close()
+                image_paths.append(tmp.name)
+                temp_files.append(tmp.name)
+
+            # Add previous generated images
+            for img_path in previous_images:
+                if os.path.exists(img_path):
+                    image_paths.append(img_path)
+
+            # Create image placeholders
+            image_placeholders = "".join([f"<image_placeholder_{i}>" for i in range(len(image_paths))])
+            full_context_with_images = f"{image_placeholders}\n{full_context}"
+
+            # Prepare conversation
+            conversations = [[{"role": "user", "content": full_context_with_images}]]
+
+            # Apply chat template
+            inputs = self.tokenizer.apply_chat_template(
+                conversations,
+                batch_image_paths=[image_paths] if image_paths else None,
+                batch_speech_paths=None,
+                mode='std',
+                padding=True,
+                truncation=True,
+                max_length=2048,
+                return_tensors='pt'
+            )
+
+            input_ids = inputs['input_ids'].to(self._device)
+            attention_mask = inputs['attention_mask'].to(self._device)
+
+            # Generate planning text (short response)
+            gen_config = {
+                "num_beams": 1,
+                "do_sample": False,
+                "temperature": 1.0,
+                "max_new_tokens": 128,  # Short planning text
+                "pad_token_id": self.tokenizer.tokenizer.pad_token_id,
+                "eos_token_id": 7,  # <|im_end|>
+            }
+
+            with torch.inference_mode():
+                outputs = self.model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    **gen_config
+                )
+
+            # Decode response
+            generated_sequences, _, _ = self.tokenizer.detokenize(
+                outputs,
+                output_image_dir=None,
+                output_speech_dir=None,
+                extract_assistant=True,
+                save_images=False,
+                save_speeches=False
+            )
+
+            plan_text = generated_sequences[0].strip()
+
+            # Clean up temp files
+            for temp_file in temp_files:
+                try:
+                    os.unlink(temp_file)
+                except:
+                    pass
+
+            return plan_text
+
+        except Exception as e:
+            eval_logger.error(f"Planning text generation failed for doc {doc_id}: {e}")
+            import traceback
+            eval_logger.error(traceback.format_exc())
+            return ""
+
+    def _multi_round_generate(
+        self,
+        prompt: str,
+        generation_prompt: str,
+        doc_id: str,
+        task: str,
+        split: str,
+        original_image: Optional[Image.Image],
+        interleaved_config: dict,
+        doc: dict,
+    ) -> Tuple[str, List[str]]:
+        """
+        Multi-round generation mode for tasks requiring multiple visualization steps
+
+        Args:
+            prompt: Original question text
+            generation_prompt: Generation prompt template
+            doc_id: Document ID
+            task: Task name
+            split: Dataset split
+            original_image: Original input image
+            interleaved_config: Configuration dict from yaml (task_type, num_images, etc.)
+            doc: Document data for dynamic num_images extraction
+
+        Returns:
+            Tuple of (final_answer, list_of_generated_image_paths)
+        """
+        import json as json_module
+
+        task_type = interleaved_config.get("task_type", "jigsaw")
+
+        # Get num_images dynamically from doc if available
+        num_images = interleaved_config.get("num_images", 2)
+        if doc is not None:
+            if task_type == "maze":
+                # Get step count from ground truth
+                steps_str = doc.get("steps", "[]")
+                steps = json_module.loads(steps_str) if isinstance(steps_str, str) else steps_str
+                if steps:
+                    num_images = len(steps)
+                    eval_logger.info(f"Maze task: dynamically set num_images={num_images} from doc steps")
+            elif task_type == "sliding":
+                # Get step count from ground truth
+                steps_str = doc.get("steps_words", "[]")
+                steps = json_module.loads(steps_str) if isinstance(steps_str, str) else steps_str
+                if steps:
+                    num_images = len(steps)
+                    eval_logger.info(f"Sliding task: dynamically set num_images={num_images} from doc steps")
+
+        eval_logger.info(f"Multi-round generation: task_type={task_type}, num_images={num_images}")
+
+        # Setup output directory
+        stage1_output_dir = os.path.join(self.intermediate_dir, task, "multi_round_generated")
+        os.makedirs(stage1_output_dir, exist_ok=True)
+
+        generated_images = []
+        step_texts = []
+
+        try:
+            # For each round, generate planning text and image
+            for i in range(1, num_images + 1):
+                eval_logger.info(f"Round {i}/{num_images}: Generating step")
+
+                # Step 1: Generate planning text (for maze/sliding)
+                if task_type in ["maze", "sliding"]:
+                    if task_type == "maze":
+                        plan_prompt = f'Now planning for step {i}, Please output a sentence in the form: "Next, move one step up/down/left/right."'
+                    else:  # sliding
+                        plan_prompt = f'Now planning for step {i}, Please output a sentence describing which tile to move and in which direction.'
+
+                    # Generate planning text
+                    plan_text = self._generate_planning_text(
+                        prompt=prompt,
+                        plan_prompt=plan_prompt,
+                        doc_id=doc_id,
+                        original_image=original_image,
+                        previous_steps=step_texts,
+                        previous_images=generated_images,
+                    )
+                    eval_logger.info(f"Step {i} plan: {plan_text}")
+                    step_texts.append(plan_text)
+
+                # Step 2: Generate image
+                if task_type == "jigsaw":
+                    if i == 1:
+                        img_prompt = "Output ONLY a single image with Candidate 0 placed in the bottom-right cell. No text."
+                    else:
+                        img_prompt = "Output ONLY a single image with Candidate 1 placed in the bottom-right cell. No text."
+                elif task_type in ["maze", "sliding"]:
+                    img_prompt = f"Now, generate the image for step {i}."
+                else:
+                    img_prompt = f"Generate visualization {i}."
+
+                # Generate image for this round
+                round_text, round_images = self._stage1_generate_image(
+                    generation_prompt=img_prompt,
+                    doc_id=f"{doc_id}_round{i}",
+                    task=task,
+                    original_image=original_image,
+                )
+
+                if round_images and len(round_images) > 0:
+                    # Rename to include round number
+                    for img_path in round_images:
+                        if os.path.exists(img_path):
+                            dir_name = os.path.dirname(img_path)
+                            ext = os.path.splitext(img_path)[1]
+                            new_filename = f"doc_{doc_id}_round_{i}{ext}"
+                            new_path = os.path.join(dir_name, new_filename)
+                            os.rename(img_path, new_path)
+                            generated_images.append(new_path)
+                            eval_logger.info(f"Round {i}: Saved image to {new_path}")
+                        else:
+                            eval_logger.warning(f"Round {i}: Generated image not found at {img_path}")
+                else:
+                    eval_logger.warning(f"Round {i}: No image generated")
+
+                step_texts.append(round_text)
+
+            # Generate final answer using all generated images
+            eval_logger.info(f"Generating final answer with {len(generated_images)} images")
+            final_answer = self._stage2_answer_with_image_multi(
+                question=prompt,
+                image_paths=generated_images,
+                doc_id=doc_id,
+                original_image=original_image,
+            )
+
+            return final_answer, generated_images
+
+        except Exception as e:
+            eval_logger.error(f"Multi-round generation failed for doc {doc_id}: {e}")
             import traceback
             eval_logger.error(traceback.format_exc())
             if self.fail_gracefully:
@@ -468,6 +747,133 @@ class MIOVisualCoT(lmms):
             else:
                 raise
 
+    def _stage2_answer_with_image_multi(
+        self,
+        question: str,
+        image_paths: List[str],
+        doc_id: str,
+        original_image: Optional[Image.Image] = None,
+    ) -> str:
+        """
+        Stage 2: Answer question using multiple generated images
+
+        Args:
+            question: Original question text
+            image_paths: List of paths to generated images
+            doc_id: Document ID for logging
+            original_image: Original input image
+
+        Returns:
+            Answer text
+        """
+        eval_logger.info(f"Stage 2 (Multi): Answering with {len(image_paths)} generated images for doc {doc_id}")
+
+        try:
+            # Prepare image paths for tokenizer
+            # Order: original image first, then all generated images
+            all_image_paths = []
+
+            # Save original image to temp file if provided
+            temp_files = []
+            if original_image is not None:
+                import tempfile
+                tmp = tempfile.NamedTemporaryFile(suffix='.jpg', delete=False)
+                original_image.save(tmp.name, 'JPEG')
+                tmp.close()
+                all_image_paths.append(tmp.name)
+                temp_files.append(tmp.name)
+                eval_logger.info(f"Stage 2 (Multi): Added original image")
+
+            # Add all generated images
+            for img_path in image_paths:
+                if os.path.exists(img_path):
+                    all_image_paths.append(img_path)
+                else:
+                    eval_logger.warning(f"Stage 2 (Multi): Generated image not found: {img_path}")
+
+            eval_logger.info(f"Stage 2 (Multi): Total images: {len(all_image_paths)}")
+
+            # Create image placeholders
+            image_placeholders = "".join([f"<image_placeholder_{i}>" for i in range(len(all_image_paths))])
+            question_with_images = f"{image_placeholders}\n{question}"
+
+            # Prepare conversation
+            conversations = [[{"role": "user", "content": question_with_images}]]
+
+            # Apply chat template
+            inputs = self.tokenizer.apply_chat_template(
+                conversations,
+                batch_image_paths=[all_image_paths],
+                batch_speech_paths=None,
+                mode='std',
+                padding=True,
+                truncation=True,
+                max_length=2048,
+                return_tensors='pt'
+            )
+
+            input_ids = inputs['input_ids'].to(self._device)
+            attention_mask = inputs['attention_mask'].to(self._device)
+
+            # Generate answer
+            gen_config = {
+                "num_beams": self.stage2_num_beams,
+                "do_sample": self.stage2_do_sample,
+                "temperature": self.stage2_temperature,
+                "top_p": self.stage2_top_p,
+                "repetition_penalty": self.stage2_repetition_penalty,
+                "max_new_tokens": self.stage2_max_new_tokens,
+                "pad_token_id": self.tokenizer.tokenizer.pad_token_id,
+                "eos_token_id": 7,  # <|im_end|>
+            }
+
+            with torch.inference_mode():
+                outputs = self.model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    **gen_config
+                )
+
+            # Decode response
+            generated_sequences, _, _ = self.tokenizer.detokenize(
+                outputs,
+                output_image_dir=None,
+                output_speech_dir=None,
+                extract_assistant=True,
+                save_images=False,
+                save_speeches=False
+            )
+
+            response = generated_sequences[0].strip()
+
+            # Clean up any image/speech tokens
+            import re
+            response = re.sub(r'<img\d+>', '', response)
+            response = re.sub(r'</?image>', '', response)
+            response = re.sub(r'<spch\d+>', '', response)
+            response = re.sub(r'</?spch>', '', response)
+            response = response.strip()
+
+            eval_logger.info(f"Stage 2 (Multi): Generated answer for doc {doc_id}")
+
+            # Clean up temp files
+            for temp_file in temp_files:
+                try:
+                    os.unlink(temp_file)
+                except:
+                    pass
+
+            return response
+
+        except Exception as e:
+            eval_logger.error(f"Stage 2 (Multi) failed for doc {doc_id}: {e}")
+            import traceback
+            eval_logger.error(traceback.format_exc())
+            if self.fail_gracefully:
+                return ""
+            else:
+                raise
+
     def _save_intermediate_artifacts(
         self,
         doc_id: str,
@@ -559,37 +965,57 @@ class MIOVisualCoT(lmms):
             eval_logger.info(f"Processing doc {doc_id} from task {task}")
             eval_logger.info(f"{'='*60}")
 
-            # Stage 1: Generate visualization image (REQUIRES original image as input)
-            stage1_text, generated_images = self._stage1_generate_image(
-                generation_prompt=generation_prompt,
-                doc_id=doc_id,
-                task=task,
-                original_image=original_image,  # MUST pass original image
-            )
+            # Check if this is multi-round generation mode (like Uni-MMMU)
+            # Support both bagel_interleaved (for compatibility) and mio_interleaved
+            interleaved_config = gen_kwargs.get("bagel_interleaved", gen_kwargs.get("mio_interleaved", None))
 
-            # Stage 2: Answer question 
-            # If no auxiliary image was generated, still use original image to answer
-            # Note: contexts has been cleaned to contain only the question text (GEN_PROMPT tags removed)
-            if not generated_images or len(generated_images) == 0:
-                eval_logger.warning(
-                    f"No auxiliary image generated for doc {doc_id}, using original image only in Stage 2"
-                )
-                # Stage 2 with original image only (no auxiliary)
-                final_answer = self._stage2_answer_with_image(
-                    question=contexts,
-                    image_path=None,  # No auxiliary image
+            if interleaved_config is not None:
+                # Multi-round generation mode
+                eval_logger.info(f"Multi-round generation mode enabled for doc {doc_id}")
+                final_answer, generated_images = self._multi_round_generate(
+                    prompt=contexts,
+                    generation_prompt=generation_prompt,
                     doc_id=doc_id,
-                    original_image=original_image  # Only original image
+                    task=task,
+                    split=split,
+                    original_image=original_image,
+                    interleaved_config=interleaved_config,
+                    doc=doc,
                 )
+                stage1_text = ""  # Not used in multi-round mode
             else:
-                # Stage 2 with both original and auxiliary images
-                # Image order: [original_image (primary), auxiliary_image (reference)]
-                final_answer = self._stage2_answer_with_image(
-                    question=contexts,  # Clean question text without tags
-                    image_path=generated_images[0],  # Generated auxiliary/visualization image
+                # Single-round generation mode (original behavior)
+                # Stage 1: Generate visualization image (REQUIRES original image as input)
+                stage1_text, generated_images = self._stage1_generate_image(
+                    generation_prompt=generation_prompt,
                     doc_id=doc_id,
-                    original_image=original_image  # Original image as primary reference
+                    task=task,
+                    original_image=original_image,  # MUST pass original image
                 )
+
+                # Stage 2: Answer question
+                # If no auxiliary image was generated, still use original image to answer
+                # Note: contexts has been cleaned to contain only the question text (GEN_PROMPT tags removed)
+                if not generated_images or len(generated_images) == 0:
+                    eval_logger.warning(
+                        f"No auxiliary image generated for doc {doc_id}, using original image only in Stage 2"
+                    )
+                    # Stage 2 with original image only (no auxiliary)
+                    final_answer = self._stage2_answer_with_image(
+                        question=contexts,
+                        image_path=None,  # No auxiliary image
+                        doc_id=doc_id,
+                        original_image=original_image  # Only original image
+                    )
+                else:
+                    # Stage 2 with both original and auxiliary images
+                    # Image order: [original_image (primary), auxiliary_image (reference)]
+                    final_answer = self._stage2_answer_with_image(
+                        question=contexts,  # Clean question text without tags
+                        image_path=generated_images[0],  # Generated auxiliary/visualization image
+                        doc_id=doc_id,
+                        original_image=original_image  # Original image as primary reference
+                    )
 
             # Save intermediate artifacts if enabled
             self._save_intermediate_artifacts(

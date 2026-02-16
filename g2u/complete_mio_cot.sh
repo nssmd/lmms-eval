@@ -44,6 +44,14 @@ bash /home/aiscuser/lmms-eval/g2u/mio_cot.sh "6" "uni_mmmu_cot" "./logs/mio_cot/
 # VSP CoT - GPU 0
 echo "Task 7/7: VSP CoT"
 bash /home/aiscuser/lmms-eval/g2u/mio_cot.sh "7" "vsp_cot" "./logs/mio_cot/vsp" "m-a-p/MIO-7B-Instruct" "29706" "caes0r/mio"
+bash /home/aiscuser/lmms-eval/g2u/mio_cot.sh "0" "babyvision_cot" "./logs/mio_cot/babyvision_cot" "m-a-p/MIO-7B-Instruct" "29708" "caes0r/mio"
+bash /home/aiscuser/lmms-eval/g2u/mio_cot.sh "1" "auxsolidmath_easy_visual_cot" "./logs/mio_cot/auxsolidmath_easy_visual_cot" "m-a-p/MIO-7B-Instruct" "29819" "caes0r/mio" "" "100"
+bash /home/aiscuser/lmms-eval/g2u/mio_cot.sh "7" "geometry3k_visual_cot" "./logs/mio_cot/geometry3k_visual_cot" "m-a-p/MIO-7B-Instruct" "29713" "caes0r/mio" "" "100"
+bash /home/aiscuser/lmms-eval/g2u/mio_cot.sh "6" "phyx_cot" "./logs/mio_cot/phyx_cot" "m-a-p/MIO-7B-Instruct" "29717" "caes0r/mio"
+  bash /home/aiscuser/lmms-eval/g2u/mio_cot.sh "0" "uni_mmmu_maze100_visual_cot" "./logs/mio_cot/maze" "m-a-p/MIO-7B-Instruct" "29718" "caes0r/mio"
+  "caes0r/mio"
+  bash /home/aiscuser/lmms-eval/g2u/mio_cot.sh "1" "uni_mmmu_sliding54_visual_cot" "./logs/mio_cot/sliding" "m-a-p/MIO-7B-Instruct" "29728" "caes0r/mio"
+  "caes0r/mio"
 
 echo ""
 echo "======================================"

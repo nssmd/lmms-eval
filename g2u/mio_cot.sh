@@ -6,7 +6,7 @@
 # Stage 2: Answer question using both original and generated images
 #
 # Usage:
-#   bash mio_cot.sh [GPU_IDS] [TASK] [OUTPUT_PATH] [MODEL_PATH] [MASTER_PORT] [HF_REPO]
+#   bash mio_cot.sh [GPU_IDS] [TASK] [OUTPUT_PATH] [MODEL_PATH] [MASTER_PORT] [HF_REPO] [LIMIT]
 #
 # Examples:
 #   # ChartQA Visual CoT (100 samples)
@@ -26,6 +26,9 @@
 #
 #   # With HuggingFace upload
 #   bash mio_cot.sh "0" "chartqa100_visual_cot" "./logs/test" "m-a-p/MIO-7B-Instruct" "29603" "username/repo-name"
+#
+#   # With limit (test on 10 samples)
+#   bash mio_cot.sh "0" "chartqa100_visual_cot" "./logs/test" "m-a-p/MIO-7B-Instruct" "29603" "" "10"
 
 # ============ Configuration ============
 GPU_IDS=${1:-"0"}
@@ -34,7 +37,14 @@ OUTPUT_PATH=${3:-"./logs/mio_cot_${TASK}"}
 MODEL_PATH=${4:-"m-a-p/MIO-7B-Instruct"}
 MASTER_PORT_ARG=${5:-"29603"}
 HF_REPO=${6:-""}  # Optional: HuggingFace repo to upload logs
+LIMIT=${7:-""}    # Optional: Limit number of samples for testing
 BATCH_SIZE=1
+
+# Build limit argument if provided
+LIMIT_ARG=""
+if [ -n "${LIMIT}" ]; then
+  LIMIT_ARG="--limit ${LIMIT}"
+fi
 
 # ============ Check MIO Repository ============
 if [ ! -d "../MIO" ] && [ ! -d "MIO" ]; then
@@ -75,6 +85,8 @@ MODEL_ARGS="${MODEL_ARGS},intermediate_dir=${OUTPUT_PATH}/artifacts"
 MODEL_ARGS="${MODEL_ARGS},fail_gracefully=true"
 
 # ============ Environment Setup ============
+# Fix libstdc++ version issue
+export LD_PRELOAD=/opt/conda/envs/ptca/lib/libstdc++.so.6:${LD_PRELOAD}
 export LD_LIBRARY_PATH=/home/aiscuser/cuda_compat:/usr/local/cuda-12.6/lib64:$LD_LIBRARY_PATH
 export CUDA_VISIBLE_DEVICES=${GPU_IDS}
 export MASTER_PORT=${MASTER_PORT_ARG}
@@ -97,6 +109,9 @@ echo "Master Port:   ${MASTER_PORT}"
 if [ -n "${HF_REPO}" ]; then
     echo "HF Upload:     ${HF_REPO}"
 fi
+if [ -n "${LIMIT}" ]; then
+    echo "Limit:         ${LIMIT}"
+fi
 echo "======================================"
 echo ""
 echo "Two-Stage Visual CoT Process:"
@@ -114,7 +129,8 @@ python -m lmms_eval \
   --output_path ${OUTPUT_PATH} \
   --log_samples \
   --log_samples_suffix mio_cot_${TASK} \
-  --verbosity INFO
+  --verbosity INFO \
+  ${LIMIT_ARG}
 
 echo ""
 echo "======================================"

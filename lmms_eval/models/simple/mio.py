@@ -142,6 +142,9 @@ class MIO(lmms):
                         if isinstance(visual, Image.Image):
                             # Create temp file with delete=False to keep it
                             tmp = tempfile.NamedTemporaryFile(suffix='.jpg', delete=False)
+                            # Convert RGBA to RGB if needed (JPEG doesn't support transparency)
+                            if visual.mode != 'RGB':
+                                visual = visual.convert('RGB')
                             visual.save(tmp.name, 'JPEG')
                             tmp.close()
                             image_paths.append(tmp.name)
